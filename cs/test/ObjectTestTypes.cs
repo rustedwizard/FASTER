@@ -34,8 +34,9 @@ namespace FASTER.test
 
     public class MyKeySerializer : BinaryObjectSerializer<MyKey>
     {
-        public override void Deserialize(ref MyKey obj)
+        public override void Deserialize(out MyKey obj)
         {
+            obj = new MyKey();
             obj.key = reader.ReadInt32();
         }
 
@@ -52,8 +53,9 @@ namespace FASTER.test
 
     public class MyValueSerializer : BinaryObjectSerializer<MyValue>
     {
-        public override void Deserialize(ref MyValue obj)
+        public override void Deserialize(out MyValue obj)
         {
+            obj = new MyValue();
             obj.value = reader.ReadInt32();
         }
 
@@ -85,6 +87,8 @@ namespace FASTER.test
             value.value += input.value;
             return true;
         }
+
+        public bool NeedCopyUpdate(ref MyKey key, ref MyInput input, ref MyValue oldValue) => true;
 
         public void CopyUpdater(ref MyKey key, ref MyInput input, ref MyValue oldValue, ref MyValue newValue)
         {
@@ -154,6 +158,8 @@ namespace FASTER.test
             return true;
         }
 
+        public bool NeedCopyUpdate(ref MyKey key, ref MyInput input, ref MyValue oldValue) => true;
+
         public void CopyUpdater(ref MyKey key, ref MyInput input, ref MyValue oldValue, ref MyValue newValue)
         {
             newValue = new MyValue { value = oldValue.value + input.value };
@@ -161,6 +167,9 @@ namespace FASTER.test
 
         public void ConcurrentReader(ref MyKey key, ref MyInput input, ref MyValue value, ref MyOutput dst)
         {
+            if (dst == null)
+                dst = new MyOutput();
+
             dst.value = value;
         }
 
@@ -205,6 +214,9 @@ namespace FASTER.test
 
         public void SingleReader(ref MyKey key, ref MyInput input, ref MyValue value, ref MyOutput dst)
         {
+            if (dst == null)
+                dst = new MyOutput();
+
             dst.value = value;
         }
 
@@ -226,6 +238,8 @@ namespace FASTER.test
             value.value += input.value;
             return true;
         }
+
+        public bool NeedCopyUpdate(ref int key, ref MyInput input, ref MyValue oldValue) => true;
 
         public void CopyUpdater(ref int key, ref MyInput input, ref MyValue oldValue, ref MyValue newValue)
         {
@@ -295,8 +309,9 @@ namespace FASTER.test
 
     public class MyLargeValueSerializer : BinaryObjectSerializer<MyLargeValue>
     {
-        public override void Deserialize(ref MyLargeValue obj)
+        public override void Deserialize(out MyLargeValue obj)
         {
+            obj = new MyLargeValue();
             int size = reader.ReadInt32();
             obj.value = reader.ReadBytes(size);
         }
@@ -336,6 +351,8 @@ namespace FASTER.test
         public void DeleteCompletionCallback(ref MyKey key, Empty ctx)
         {
         }
+
+        public bool NeedCopyUpdate(ref MyKey key, ref MyInput input, ref MyLargeValue oldValue) => true;
 
         public void CopyUpdater(ref MyKey key, ref MyInput input, ref MyLargeValue oldValue, ref MyLargeValue newValue)
         {

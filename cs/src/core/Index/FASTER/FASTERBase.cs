@@ -2,9 +2,6 @@
 // Licensed under the MIT license.
 
 using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -80,7 +77,6 @@ namespace FASTER.core
     [StructLayout(LayoutKind.Explicit, Size = Constants.kEntriesPerBucket * 8)]
     internal unsafe struct HashBucket
     {
-
         public const long kPinConstant = (1L << 48);
 
         public const long kExclusiveLatchBitMask = (1L << 63);
@@ -143,10 +139,9 @@ namespace FASTER.core
     {
         [FieldOffset(0)]
         public long word;
-
         public long Address
         {
-            get
+            readonly get
             {
                 return word & Constants.kAddressMask;
             }
@@ -158,10 +153,9 @@ namespace FASTER.core
             }
         }
 
-
         public ushort Tag
         {
-            get
+            readonly get
             {
                 return (ushort)((word & Constants.kTagPositionMask) >> Constants.kTagShift);
             }
@@ -175,7 +169,7 @@ namespace FASTER.core
 
         public bool Pending
         {
-            get
+            readonly get
             {
                 return (word & Constants.kPendingBitMask) != 0;
             }
@@ -195,7 +189,7 @@ namespace FASTER.core
 
         public bool Tentative
         {
-            get
+            readonly get
             {
                 return (word & Constants.kTentativeBitMask) != 0;
             }
@@ -215,7 +209,7 @@ namespace FASTER.core
 
         public bool ReadCache
         {
-            get
+            readonly get
             {
                 return (word & Constants.kReadCacheBitMask) != 0;
             }
@@ -232,7 +226,6 @@ namespace FASTER.core
                 }
             }
         }
-
     }
 
     internal unsafe struct InternalHashTable
@@ -261,9 +254,6 @@ namespace FASTER.core
 
         // Used as an atomic counter to check if resizing is complete
         internal long numPendingChunksToBeSplit;
-
-        // Epoch set for resizing
-        internal int resizeEpoch;
 
         internal LightEpoch epoch;
 
@@ -314,7 +304,7 @@ namespace FASTER.core
             }
 
             minTableSize = size;
-            resizeInfo = default(ResizeInfo);
+            resizeInfo = default;
             resizeInfo.status = ResizeOperationStatus.DONE;
             resizeInfo.version = 0;
             Initialize(resizeInfo.version, size, sector_size);
@@ -326,7 +316,7 @@ namespace FASTER.core
         /// <param name="version"></param>
         /// <param name="size"></param>
         /// <param name="sector_size"></param>
-        protected void Initialize(int version, long size, int sector_size)
+        internal void Initialize(int version, long size, int sector_size)
         {
             long size_bytes = size * sizeof(HashBucket);
             long aligned_size_bytes = sector_size +
@@ -390,14 +380,12 @@ namespace FASTER.core
 
                 if (target_entry_word == 0)
                 {
-                    entry = default(HashBucketEntry);
+                    entry = default;
                     return false;
                 }
                 bucket = (HashBucket*)overflowBucketsAllocator.GetPhysicalAddress(target_entry_word);
             } while (true);
         }
-
-
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal void FindOrCreateTag(long hash, ushort tag, ref HashBucket* bucket, ref int slot, ref HashBucketEntry entry, long BeginAddress)
@@ -415,7 +403,7 @@ namespace FASTER.core
 
 
                 // Install tentative tag in free slot
-                entry = default(HashBucketEntry);
+                entry = default;
                 entry.Tag = tag;
                 entry.Address = Constants.kTempInvalidAddress;
                 entry.Pending = false;
@@ -458,7 +446,7 @@ namespace FASTER.core
                         continue;
                     }
 
-                    HashBucketEntry entry = default(HashBucketEntry);
+                    HashBucketEntry entry = default;
                     entry.word = target_entry_word;
                     if (tag == entry.Tag)
                     {
@@ -498,7 +486,7 @@ namespace FASTER.core
                         continue;
                     }
 
-                    HashBucketEntry entry = default(HashBucketEntry);
+                    HashBucketEntry entry = default;
                     entry.word = target_entry_word;
                     if (tag == entry.Tag)
                     {
@@ -606,7 +594,7 @@ namespace FASTER.core
                             // Install succeeded
                             bucket = physicalBucketAddress;
                             slot = 0;
-                            entry = default(HashBucketEntry);
+                            entry = default;
                             return recordExists;
                         }
                     }
@@ -616,7 +604,7 @@ namespace FASTER.core
                         {
                             bucket = entry_slot_bucket;
                         }
-                        entry = default(HashBucketEntry);
+                        entry = default;
                         break;
                     }
                 }
@@ -657,7 +645,7 @@ namespace FASTER.core
                         continue;
                     }
 
-                    HashBucketEntry entry = default(HashBucketEntry);
+                    HashBucketEntry entry = default;
                     entry.word = target_entry_word;
                     if (tag == entry.Tag)
                     {
@@ -702,93 +690,5 @@ namespace FASTER.core
 
             return (found == expected);
         }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <returns></returns>
-        protected virtual long GetEntryCount()
-        {
-            var version = resizeInfo.version;
-            var table_size_ = state[version].size;
-            var ptable_ = state[version].tableAligned;
-            long total_entry_count = 0;
-
-            for (long bucket = 0; bucket < table_size_; ++bucket)
-            {
-                HashBucket b = *(ptable_ + bucket);
-                while (true)
-                {
-                    for (int bucket_entry = 0; bucket_entry < Constants.kOverflowBucketIndex; ++bucket_entry)
-                        if (0 != b.bucket_entries[bucket_entry])
-                            ++total_entry_count;
-                    if (b.bucket_entries[Constants.kOverflowBucketIndex] == 0) break;
-                    b = *((HashBucket*)overflowBucketsAllocator.GetPhysicalAddress((b.bucket_entries[Constants.kOverflowBucketIndex])));
-                }
-            }
-            return total_entry_count;
-        }
-
-        /// <summary>
-        /// 
-        /// </summary>
-        /// <param name="version"></param>
-        protected virtual string _DumpDistribution(int version)
-        {
-            var table_size_ = state[version].size;
-            var ptable_ = state[version].tableAligned;
-            long total_record_count = 0;
-            Dictionary<int, long> histogram = new Dictionary<int, long>();
-
-            for (long bucket = 0; bucket < table_size_; ++bucket)
-            {
-                List<int> tags = new List<int>();
-                int cnt = 0;
-                HashBucket b = *(ptable_ + bucket);
-                while (true)
-                {
-                    for (int bucket_entry = 0; bucket_entry < Constants.kOverflowBucketIndex; ++bucket_entry)
-                    {
-                        if (0 != b.bucket_entries[bucket_entry])
-                        {
-                            var x = default(HashBucketEntry);
-                            x.word = b.bucket_entries[bucket_entry];
-                            if (tags.Contains(x.Tag) && !x.Tentative)
-                                throw new FasterException("Duplicate tag found in index");
-                            tags.Add(x.Tag);
-                            ++cnt;
-                            ++total_record_count;
-                        }
-                    }
-                    if (b.bucket_entries[Constants.kOverflowBucketIndex] == 0) break;
-                    b = *((HashBucket*)overflowBucketsAllocator.GetPhysicalAddress((b.bucket_entries[Constants.kOverflowBucketIndex])));
-                }
-
-                if (!histogram.ContainsKey(cnt)) histogram[cnt] = 0;
-                histogram[cnt]++;
-            }
-
-            var distribution =
-                $"Number of hash buckets: {{{table_size_}}}\n" +
-                $"Total distinct hash-table entry count: {{{total_record_count}}}\n" +
-                $"Average #entries per hash bucket: {{{total_record_count / (double)table_size_:0.00}}}\n" +
-                $"Histogram of #entries per bucket:\n";
-            foreach (var kvp in histogram.OrderBy(e => e.Key))
-            {
-                distribution += $"  {kvp.Key} : {kvp.Value}\n";
-            }
-
-            return distribution;
-        }
-
-        /// <summary>
-        /// Dumps the distribution of each non-empty bucket in the hash table.
-        /// </summary>
-        public string DumpDistribution()
-        {
-            return _DumpDistribution(resizeInfo.version);
-        }
-
     }
-
 }

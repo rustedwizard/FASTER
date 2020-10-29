@@ -34,15 +34,16 @@ namespace FASTER.test
             return sizeof(long);
         }
 
-        public int GetAverageLength()
+        public int GetInitialLength()
         {
             return sizeof(long);
         }
 
-        public int GetInitialLength<Input>(ref Input input)
-        {
-            return sizeof(long);
-        }
+        public unsafe void Serialize(ref Key source, void* destination)
+            => Buffer.MemoryCopy(Unsafe.AsPointer(ref source), destination, GetLength(ref source), GetLength(ref source));
+
+        public unsafe ref Key AsRef(void* source) => ref Unsafe.AsRef<Key>(source);
+        public unsafe void Initialize(void* source, void* dest) { }
     }
 
     [StructLayout(LayoutKind.Explicit)]
@@ -54,20 +55,21 @@ namespace FASTER.test
         [FieldOffset(4)]
         public int field1;
 
-        public int GetAverageLength()
+        public int GetInitialLength()
         {
-            return 2*sizeof(int);
-        }
-
-        public int GetInitialLength<Input>(ref Input input)
-        {
-            return 2*sizeof(int);
+            return 2 * sizeof(int);
         }
 
         public int GetLength(ref VLValue t)
         {
             return sizeof(int) * t.length;
         }
+
+        public unsafe void Serialize(ref VLValue source, void* destination)
+            => Buffer.MemoryCopy(Unsafe.AsPointer(ref source), destination, GetLength(ref source), GetLength(ref source));
+
+        public unsafe ref VLValue AsRef(void* source) => ref Unsafe.AsRef<VLValue>(source);
+        public unsafe void Initialize(void* source, void* dest) { }
 
         public void ToIntArray(ref int[] dst)
         {
@@ -120,7 +122,7 @@ namespace FASTER.test
         public void ReadCompletionCallback(ref Key key, ref Input input, ref int[] output, Empty ctx, Status status)
         {
             Assert.IsTrue(status == Status.OK);
-            for (int i=0; i<output.Length; i++)
+            for (int i = 0; i < output.Length; i++)
             {
                 Assert.IsTrue(output[i] == output.Length);
             }
@@ -174,6 +176,8 @@ namespace FASTER.test
         {
             return true;
         }
+
+        public bool NeedCopyUpdate(ref Key key, ref Input input, ref VLValue oldValue) => true;
 
         public void CopyUpdater(ref Key key, ref Input input, ref VLValue oldValue, ref VLValue newValue)
         {
@@ -244,6 +248,8 @@ namespace FASTER.test
         {
             return true;
         }
+
+        public bool NeedCopyUpdate(ref VLValue key, ref Input input, ref VLValue oldValue) => true;
 
         public void CopyUpdater(ref VLValue key, ref Input input, ref VLValue oldValue, ref VLValue newValue)
         {

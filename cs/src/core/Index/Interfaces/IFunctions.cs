@@ -1,4 +1,5 @@
-﻿using System;
+﻿using Microsoft.Win32;
+using System;
 using System.Collections.Generic;
 
 namespace FASTER.core
@@ -63,6 +64,18 @@ namespace FASTER.core
         void InitialUpdater(ref Key key, ref Input input, ref Value value);
 
         /// <summary>
+        /// Whether we need to invoke copy-update for RMW
+        /// </summary>
+        /// <param name="key"></param>
+        /// <param name="input"></param>
+        /// <param name="oldValue"></param>
+        bool NeedCopyUpdate(ref Key key, ref Input input, ref Value oldValue)
+#if NETSTANDARD21            
+            => true
+#endif
+            ;
+
+        /// <summary>
         /// Copy-update for RMW
         /// </summary>
         /// <param name="key"></param>
@@ -112,5 +125,24 @@ namespace FASTER.core
         /// <param name="src"></param>
         /// <param name="dst"></param>
         bool ConcurrentWriter(ref Key key, ref Value src, ref Value dst);
+    }
+
+    /// <summary>
+    /// Callback functions to FASTER (two-param version)
+    /// </summary>
+    /// <typeparam name="Key"></typeparam>
+    /// <typeparam name="Value"></typeparam>
+    public interface IFunctions<Key, Value> : IFunctions<Key, Value, Value, Value, Empty>
+    {
+    }
+
+    /// <summary>
+    /// Callback functions to FASTER (two-param version with context)
+    /// </summary>
+    /// <typeparam name="Key"></typeparam>
+    /// <typeparam name="Value"></typeparam>
+    /// <typeparam name="Context"></typeparam>
+    public interface IFunctions<Key, Value, Context> : IFunctions<Key, Value, Value, Value, Context>
+    {
     }
 }

@@ -5,11 +5,11 @@ using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.IO;
-using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Azure.Storage.Blob;
 using FASTER.core;
 using Microsoft.Azure.Storage;
-using Microsoft.Azure.Storage.Blob;
 
 namespace FASTER.devices
 {
@@ -19,81 +19,170 @@ namespace FASTER.devices
     /// </summary>
     public class AzureStorageDevice : StorageDeviceBase
     {
-        private CloudBlobContainer container;
         private readonly ConcurrentDictionary<int, BlobEntry> blobs;
+        private readonly CloudBlobDirectory blobDirectory;
         private readonly string blobName;
-        private readonly bool deleteOnClose;
+        private readonly bool underLease;
 
-        // Page Blobs permit blobs of max size 8 TB, but the emulator permits only 2 GB
-        private const long MAX_BLOB_SIZE = (long)(2 * 10e8);
+        internal BlobRequestOptions BlobRequestOptionsWithoutRetry { get; private set; }
+        internal BlobRequestOptions BlobRequestOptionsWithRetry { get; private set; }
+
         // Azure Page Blobs have a fixed sector size of 512 bytes.
         private const uint PAGE_BLOB_SECTOR_SIZE = 512;
+
+        // Max upload size must be at most 4MB
+        // we use an even smaller value to improve retry/timeout behavior in highly contended situations
+        private const uint MAX_UPLOAD_SIZE = 1024 * 1024;
+
+        // Max Azure Page Blob size (used when segment size is not specified): we set this at 8 GB
+        private const long MAX_PAGEBLOB_SIZE = 8L * 1024 * 1024 * 1024;
+
+        // Whether blob files are deleted on close
+        private readonly bool deleteOnClose;
+
+        /// <summary>
+        /// Constructs a new AzureStorageDevice instance, backed by Azure Page Blobs
+        /// </summary>
+        /// <param name="cloudBlobDirectory">Cloud blob directory containing the blobs</param>
+        /// <param name="blobName">A descriptive name that will be the prefix of all blobs created with this device</param>
+        /// <param name="blobManager">Blob manager instance</param>
+        /// <param name="underLease">Whether we use leases</param>
+        /// <param name="deleteOnClose">
+        /// True if the program should delete all blobs created on call to <see cref="Dispose">Close</see>. False otherwise. 
+        /// The container is not deleted even if it was created in this constructor
+        /// </param>
+        /// <param name="capacity">The maximum number of bytes this storage device can accommondate, or CAPACITY_UNSPECIFIED if there is no such limit </param>
+        public AzureStorageDevice(CloudBlobDirectory cloudBlobDirectory, string blobName, IBlobManager blobManager = null, bool underLease = false, bool deleteOnClose = false, long capacity = Devices.CAPACITY_UNSPECIFIED)
+            : base($"{cloudBlobDirectory}\\{blobName}", PAGE_BLOB_SECTOR_SIZE, capacity)
+        {
+            this.blobs = new ConcurrentDictionary<int, BlobEntry>();
+            this.blobDirectory = cloudBlobDirectory;
+            this.blobName = blobName;
+            this.underLease = underLease;
+            this.deleteOnClose = deleteOnClose;
+
+            this.BlobManager = blobManager ?? new DefaultBlobManager(this.underLease, this.blobDirectory);
+            this.BlobRequestOptionsWithoutRetry = BlobManager.GetBlobRequestOptionsWithoutRetry();
+            this.BlobRequestOptionsWithRetry = BlobManager.GetBlobRequestOptionsWithRetry();
+
+            StartAsync().Wait();
+        }
 
         /// <summary>
         /// Constructs a new AzureStorageDevice instance, backed by Azure Page Blobs
         /// </summary>
         /// <param name="connectionString"> The connection string to use when estblishing connection to Azure Blobs</param>
         /// <param name="containerName">Name of the Azure Blob container to use. If there does not exist a container with the supplied name, one is created</param>
+        /// <param name="directoryName">Directory within blob container to use.</param>
         /// <param name="blobName">A descriptive name that will be the prefix of all blobs created with this device</param>
+        /// <param name="blobManager">Blob manager instance</param>
+        /// <param name="underLease">Whether we use leases</param>
         /// <param name="deleteOnClose">
-        /// True if the program should delete all blobs created on call to <see cref="Close">Close</see>. False otherwise. 
+        /// True if the program should delete all blobs created on call to <see cref="Dispose">Close</see>. False otherwise. 
         /// The container is not deleted even if it was created in this constructor
         /// </param>
         /// <param name="capacity">The maximum number of bytes this storage device can accommondate, or CAPACITY_UNSPECIFIED if there is no such limit </param>
-        public AzureStorageDevice(string connectionString, string containerName, string blobName, bool deleteOnClose = false, long capacity = Devices.CAPACITY_UNSPECIFIED)
-            : base(connectionString + "/" + containerName + "/" + blobName, PAGE_BLOB_SECTOR_SIZE, capacity)
+        public AzureStorageDevice(string connectionString, string containerName, string directoryName, string blobName, IBlobManager blobManager = null, bool underLease = false, bool deleteOnClose = false, long capacity = Devices.CAPACITY_UNSPECIFIED)
+            : base($"{connectionString}\\{containerName}\\{directoryName}\\{blobName}", PAGE_BLOB_SECTOR_SIZE, capacity)
         {
-            CloudStorageAccount storageAccount = CloudStorageAccount.Parse(connectionString);
-            CloudBlobClient client = storageAccount.CreateCloudBlobClient();
-            container = client.GetContainerReference(containerName);
+            var storageAccount = CloudStorageAccount.Parse(connectionString);
+            var client = storageAccount.CreateCloudBlobClient();
+            var container = client.GetContainerReference(containerName);
             container.CreateIfNotExists();
-            blobs = new ConcurrentDictionary<int, BlobEntry>();
+
+            this.blobs = new ConcurrentDictionary<int, BlobEntry>();
+            this.blobDirectory = container.GetDirectoryReference(directoryName);
             this.blobName = blobName;
+            this.underLease = underLease;
             this.deleteOnClose = deleteOnClose;
-            RecoverBlobs();
+
+            this.BlobManager = blobManager ?? new DefaultBlobManager(this.underLease, this.blobDirectory);
+            this.BlobRequestOptionsWithoutRetry = BlobManager.GetBlobRequestOptionsWithoutRetry();
+            this.BlobRequestOptionsWithRetry = BlobManager.GetBlobRequestOptionsWithRetry();
+
+            StartAsync().Wait();
         }
 
-        private void RecoverBlobs()
+        private async Task StartAsync()
         {
+            // list all the blobs representing the segments
+
             int prevSegmentId = -1;
-            foreach (IListBlobItem item in container.ListBlobs(blobName))
+            var prefix = $"{blobDirectory.Prefix}{blobName}.";
+
+            BlobContinuationToken continuationToken = null;
+            do
             {
-                string[] parts = item.Uri.Segments;
-                int segmentId = Int32.Parse(parts[parts.Length - 1].Replace(blobName, ""));
-                if (segmentId != prevSegmentId + 1)
+                if (this.underLease)
                 {
-                    startSegment = segmentId;
-                    
+                    await this.BlobManager.ConfirmLeaseAsync().ConfigureAwait(false);
                 }
-                else
+                var response = await this.blobDirectory.ListBlobsSegmentedAsync(useFlatBlobListing: false, blobListingDetails: BlobListingDetails.None, maxResults: 1000,
+                    currentToken: continuationToken, options: this.BlobRequestOptionsWithRetry, operationContext: null)
+                    .ConfigureAwait(BlobManager.ConfigureAwaitForStorage);
+
+                foreach (IListBlobItem item in response.Results)
                 {
-                    endSegment = segmentId;
+                    if (item is CloudPageBlob pageBlob)
+                    {
+                        if (Int32.TryParse(pageBlob.Name.Replace(prefix, ""), out int segmentId))
+                        {
+                            if (segmentId != prevSegmentId + 1)
+                            {
+                                startSegment = segmentId;
+                            }
+                            else
+                            {
+                                endSegment = segmentId;
+                            }
+                            prevSegmentId = segmentId;
+                        }
+                    }
                 }
-                prevSegmentId = segmentId;
+                continuationToken = response.ContinuationToken;
             }
+            while (continuationToken != null);
 
             for (int i = startSegment; i <= endSegment; i++)
             {
-                bool ret = blobs.TryAdd(i, new BlobEntry(container.GetPageBlobReference(GetSegmentBlobName(i))));
-                Debug.Assert(ret, "Recovery of blobs is single-threaded and should not yield any failure due to concurrency");
+                bool ret = this.blobs.TryAdd(i, new BlobEntry(this.blobDirectory.GetPageBlobReference(GetSegmentBlobName(i)), this.BlobManager));
+
+                if (!ret)
+                {
+                    throw new InvalidOperationException("Recovery of blobs is single-threaded and should not yield any failure due to concurrency");
+                }
             }
         }
 
         /// <summary>
-        /// <see cref="IDevice.Close">Inherited</see>
+        /// Is called on exceptions, if non-null; can be set by application
         /// </summary>
-        public override void Close()
+        private IBlobManager BlobManager { get; set; }
+
+        private string GetSegmentBlobName(int segmentId)
+        {
+            return $"{blobName}.{segmentId}";
+        }
+
+        /// <inheritdoc />
+        public override void Dispose()
         {
             // Unlike in LocalStorageDevice, we explicitly remove all page blobs if the deleteOnClose flag is set, instead of relying on the operating system
             // to delete files after the end of our process. This leads to potential problems if multiple instances are sharing the same underlying page blobs.
-            //
-            // Since this flag is presumably only used for testing though, it is probably fine.
+            // Since this flag is only used for testing, it is probably fine.
             if (deleteOnClose)
+                PurgeAll();
+        }
+
+        /// <summary>
+        /// Purge all blobs related to this device. Do not use if 
+        /// multiple instances are sharing the same underlying page blobs.
+        /// </summary>
+        public void PurgeAll()
+        {
+            foreach (var entry in blobs)
             {
-                foreach (var entry in blobs)
-                {
-                    entry.Value.GetPageBlob().Delete();
-                }
+                entry.Value.PageBlob.Delete();
             }
         }
 
@@ -105,121 +194,272 @@ namespace FASTER.devices
         /// <param name="result"></param>
         public override void RemoveSegmentAsync(int segment, AsyncCallback callback, IAsyncResult result)
         {
-            if (blobs.TryRemove(segment, out BlobEntry blob))
+            if (this.blobs.TryRemove(segment, out BlobEntry blob))
             {
-                CloudPageBlob pageBlob = blob.GetPageBlob();
-                pageBlob.BeginDelete(ar =>
-                {
-                    try
-                    {
-                        pageBlob.EndDelete(ar);
+                CloudPageBlob pageBlob = blob.PageBlob;
 
-                    }
-                    catch (Exception)
-                    {
-                        // Can I do anything else other than printing out an error message?
-                    }
-                    callback(ar);
-                }, result);
+                if (this.underLease)
+                {
+                    this.BlobManager.ConfirmLeaseAsync().GetAwaiter().GetResult();
+                }
+
+                if (!this.BlobManager.CancellationToken.IsCancellationRequested)
+                {
+                    pageBlob.DeleteAsync(cancellationToken: this.BlobManager.CancellationToken)
+                       .ContinueWith((Task t) =>
+                       {
+                           if (t.IsFaulted)
+                           {
+                               this.BlobManager?.HandleBlobError(nameof(RemoveSegmentAsync), "could not remove page blob for segment", pageBlob?.Name, t.Exception, false);
+                           }
+                           callback(result);
+                       });
+                }
             }
         }
 
-        /// <summary>
-        /// <see cref="IDevice.ReadAsync(int, ulong, IntPtr, uint, IOCompletionCallback, IAsyncResult)">Inherited</see>
-        /// </summary>
-        public override unsafe void ReadAsync(int segmentId, ulong sourceAddress, IntPtr destinationAddress, uint readLength, IOCompletionCallback callback, IAsyncResult asyncResult)
+        //---- The actual read and write accesses to the page blobs
+
+        private unsafe Task WritePortionToBlobUnsafeAsync(CloudPageBlob blob, IntPtr sourceAddress, long destinationAddress, long offset, uint length)
         {
+            return this.WritePortionToBlobAsync(new UnmanagedMemoryStream((byte*)sourceAddress + offset, length), blob, sourceAddress, destinationAddress, offset, length);
+        }
+
+        private async Task WritePortionToBlobAsync(UnmanagedMemoryStream stream, CloudPageBlob blob, IntPtr sourceAddress, long destinationAddress, long offset, uint length)
+        {
+            try
+            {
+                await BlobManager.AsyncStorageWriteMaxConcurrency.WaitAsync();
+
+                int numAttempts = 0;
+                long streamPosition = stream.Position;
+
+                while (true) // retry loop
+                {
+                    numAttempts++;
+                    try
+                    {
+                        if (this.underLease)
+                        {
+                            await this.BlobManager.ConfirmLeaseAsync().ConfigureAwait(false);
+                        }
+
+                        if (length > 0)
+                        {
+                            await blob.WritePagesAsync(stream, destinationAddress + offset,
+                                contentChecksum: null, accessCondition: null, options: this.BlobRequestOptionsWithoutRetry, operationContext: null, cancellationToken: this.BlobManager.CancellationToken)
+                                .ConfigureAwait(BlobManager.ConfigureAwaitForStorage);
+                        }
+                        break;
+                    }
+                    catch (StorageException e) when (this.underLease && IsTransientStorageError(e) && numAttempts < BlobManager.MaxRetries)
+                    {
+                        TimeSpan nextRetryIn = TimeSpan.FromSeconds(1 + Math.Pow(2, (numAttempts - 1)));
+                        this.BlobManager?.HandleBlobError(nameof(WritePortionToBlobAsync), $"could not write to page blob, will retry in {nextRetryIn}s", blob?.Name, e, false);
+                        await Task.Delay(nextRetryIn);
+                        stream.Seek(streamPosition, SeekOrigin.Begin);  // must go back to original position before retrying
+                        continue;
+                    }
+                    catch (Exception exception) when (!IsFatal(exception))
+                    {
+                        this.BlobManager?.HandleBlobError(nameof(WritePortionToBlobAsync), "could not write to page blob", blob?.Name, exception, false);
+                        throw;
+                    }
+                };
+            }
+            finally
+            {
+                BlobManager.AsyncStorageWriteMaxConcurrency.Release();
+                stream.Dispose();
+            }
+        }
+
+        private unsafe Task ReadFromBlobUnsafeAsync(CloudPageBlob blob, long sourceAddress, long destinationAddress, uint readLength)
+        {
+            return this.ReadFromBlobAsync(new UnmanagedMemoryStream((byte*)destinationAddress, readLength, readLength, FileAccess.Write), blob, sourceAddress, destinationAddress, readLength);
+        }
+
+        private async Task ReadFromBlobAsync(UnmanagedMemoryStream stream, CloudPageBlob blob, long sourceAddress, long destinationAddress, uint readLength)
+        {
+            Debug.WriteLine($"AzureStorageDevice.ReadFromBlobAsync Called target={blob.Name}");
+
+            try
+            {
+                await BlobManager.AsyncStorageReadMaxConcurrency.WaitAsync();
+
+                int numAttempts = 0;
+
+                while (true) // retry loop
+                {
+                    numAttempts++;
+                    try
+                    {
+                        if (this.underLease)
+                        {
+                            await this.BlobManager.ConfirmLeaseAsync().ConfigureAwait(false);
+                        }
+
+                        Debug.WriteLine($"starting download target={blob.Name} readLength={readLength} sourceAddress={sourceAddress}");
+
+                        if (readLength > 0)
+                        {
+                            await blob.DownloadRangeToStreamAsync(stream, sourceAddress, readLength,
+                                 accessCondition: null, options: this.BlobRequestOptionsWithoutRetry, operationContext: null, cancellationToken: this.BlobManager.CancellationToken)
+                                .ConfigureAwait(BlobManager.ConfigureAwaitForStorage);
+                        }
+
+                        Debug.WriteLine($"finished download target={blob.Name} readLength={readLength} sourceAddress={sourceAddress}");
+
+                        if (stream.Position != readLength)
+                        {
+                            throw new InvalidDataException($"wrong amount of data received from page blob, expected={readLength}, actual={stream.Position}");
+                        }
+                        break;
+                    }
+                    catch (StorageException e) when (this.underLease && IsTransientStorageError(e) && numAttempts < BlobManager.MaxRetries)
+                    {
+                        TimeSpan nextRetryIn = TimeSpan.FromSeconds(1 + Math.Pow(2, (numAttempts - 1)));
+                        this.BlobManager?.HandleBlobError(nameof(ReadFromBlobAsync), $"could not write to page blob, will retry in {nextRetryIn}s", blob?.Name, e, false);
+                        await Task.Delay(nextRetryIn);
+                        stream.Seek(0, SeekOrigin.Begin); // must go back to original position before retrying
+                        continue;
+                    }
+                    catch (Exception exception) when (!IsFatal(exception))
+                    {
+                        this.BlobManager?.HandleBlobError(nameof(ReadFromBlobAsync), "could not read from page blob", blob?.Name, exception, false);
+                        throw;
+                    }
+                }
+            }
+            finally
+            {
+                BlobManager.AsyncStorageReadMaxConcurrency.Release();
+                stream.Dispose();
+            }
+        }
+
+        //---- the overridden methods represent the interface for a generic storage device
+
+        /// <summary>
+        /// <see cref="IDevice.ReadAsync(int, ulong, IntPtr, uint, DeviceIOCompletionCallback, object)">Inherited</see>
+        /// </summary>
+        public override unsafe void ReadAsync(int segmentId, ulong sourceAddress, IntPtr destinationAddress, uint readLength, DeviceIOCompletionCallback callback, object context)
+        {
+            Debug.WriteLine($"AzureStorageDevice.ReadAsync Called segmentId={segmentId} sourceAddress={sourceAddress} readLength={readLength}");
+
             // It is up to the allocator to make sure no reads are issued to segments before they are written
-            if (!blobs.TryGetValue(segmentId, out BlobEntry blobEntry)) throw new InvalidOperationException("Attempting to read non-existent segments");
+            if (!blobs.TryGetValue(segmentId, out BlobEntry blobEntry))
+            {
+                var nonLoadedBlob = this.blobDirectory.GetPageBlobReference(GetSegmentBlobName(segmentId));
+                var exception = new InvalidOperationException("Attempt to read a non-loaded segment");
+                this.BlobManager?.HandleBlobError(nameof(ReadAsync), exception.Message, nonLoadedBlob?.Name, exception, true);
+                throw exception;
+            }
 
-            // Even though Azure Page Blob does not make use of Overlapped, we populate one to conform to the callback API
-            Overlapped ov = new Overlapped(0, 0, IntPtr.Zero, asyncResult);
-            NativeOverlapped* ovNative = ov.UnsafePack(callback, IntPtr.Zero);
-
-            UnmanagedMemoryStream stream = new UnmanagedMemoryStream((byte*)destinationAddress, readLength, readLength, FileAccess.Write);
-            CloudPageBlob pageBlob = blobEntry.GetPageBlob();
-            pageBlob.BeginDownloadRangeToStream(stream, (Int64)sourceAddress, readLength, ar => {
-                try
-                {
-                    pageBlob.EndDownloadRangeToStream(ar);
-                }
-                // I don't think I can be more specific in catch here because no documentation on exception behavior is provided
-                catch (Exception e)
-                {
-                    Trace.TraceError(e.Message);
-                    // Is there any documentation on the meaning of error codes here? The handler suggests that any non-zero value is an error
-                    // but does not distinguish between them.
-                    callback(2, readLength, ovNative);
-                }
-                callback(0, readLength, ovNative);
-            }, asyncResult);
+            this.ReadFromBlobUnsafeAsync(blobEntry.PageBlob, (long)sourceAddress, (long)destinationAddress, readLength)
+                  .ContinueWith((Task t) =>
+                  {
+                      if (t.IsFaulted)
+                      {
+                          Debug.WriteLine("AzureStorageDevice.ReadAsync Returned (Failure)");
+                          callback(uint.MaxValue, readLength, context);
+                      }
+                      else
+                      {
+                          Debug.WriteLine("AzureStorageDevice.ReadAsync Returned");
+                          callback(0, readLength, context);
+                      }
+                  });
         }
 
         /// <summary>
-        /// <see cref="IDevice.WriteAsync(IntPtr, int, ulong, uint, IOCompletionCallback, IAsyncResult)">Inherited</see>
+        /// <see cref="IDevice.WriteAsync(IntPtr, int, ulong, uint, DeviceIOCompletionCallback, object)">Inherited</see>
         /// </summary>
-        public override void WriteAsync(IntPtr sourceAddress, int segmentId, ulong destinationAddress, uint numBytesToWrite, IOCompletionCallback callback, IAsyncResult asyncResult)
+        public override void WriteAsync(IntPtr sourceAddress, int segmentId, ulong destinationAddress, uint numBytesToWrite, DeviceIOCompletionCallback callback, object context)
         {
+            Debug.WriteLine($"AzureStorageDevice.WriteAsync Called segmentId={segmentId} destinationAddress={destinationAddress} numBytesToWrite={numBytesToWrite}");
+
             if (!blobs.TryGetValue(segmentId, out BlobEntry blobEntry))
             {
-                BlobEntry entry = new BlobEntry();
+                BlobEntry entry = new BlobEntry(this.BlobManager);
                 if (blobs.TryAdd(segmentId, entry))
                 {
-                    CloudPageBlob pageBlob = container.GetPageBlobReference(GetSegmentBlobName(segmentId));
+                    CloudPageBlob pageBlob = this.blobDirectory.GetPageBlobReference(GetSegmentBlobName(segmentId));
+
                     // If segment size is -1, which denotes absence, we request the largest possible blob. This is okay because
                     // page blobs are not backed by real pages on creation, and the given size is only a the physical limit of 
                     // how large it can grow to.
-                    var size = segmentSize == -1 ? MAX_BLOB_SIZE : segmentSize;
+                    var size = segmentSize == -1 ? MAX_PAGEBLOB_SIZE : segmentSize;
+
                     // If no blob exists for the segment, we must first create the segment asynchronouly. (Create call takes ~70 ms by measurement)
                     // After creation is done, we can call write.
-                    entry.CreateAsync(size, pageBlob);
+                    var _ = entry.CreateAsync(size, pageBlob);
                 }
                 // Otherwise, some other thread beat us to it. Okay to use their blobs.
                 blobEntry = blobs[segmentId];
             }
-            TryWriteAsync(blobEntry, sourceAddress, destinationAddress, numBytesToWrite, callback, asyncResult);
+            this.TryWriteAsync(blobEntry, sourceAddress, destinationAddress, numBytesToWrite, callback, context);
         }
 
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void TryWriteAsync(BlobEntry blobEntry, IntPtr sourceAddress, ulong destinationAddress, uint numBytesToWrite, IOCompletionCallback callback, IAsyncResult asyncResult)
+        private void TryWriteAsync(BlobEntry blobEntry, IntPtr sourceAddress, ulong destinationAddress, uint numBytesToWrite, DeviceIOCompletionCallback callback, object context)
         {
-            CloudPageBlob pageBlob = blobEntry.GetPageBlob();
             // If pageBlob is null, it is being created. Attempt to queue the write for the creator to complete after it is done
-            if (pageBlob == null
-                && blobEntry.TryQueueAction(p => WriteToBlobAsync(p, sourceAddress, destinationAddress, numBytesToWrite, callback, asyncResult))) return;
-
-            // Otherwise, invoke directly.
-            WriteToBlobAsync(pageBlob, sourceAddress, destinationAddress, numBytesToWrite, callback, asyncResult);
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static unsafe void WriteToBlobAsync(CloudPageBlob blob, IntPtr sourceAddress, ulong destinationAddress, uint numBytesToWrite, IOCompletionCallback callback, IAsyncResult asyncResult)
-        {
-            // Even though Azure Page Blob does not make use of Overlapped, we populate one to conform to the callback API
-            Overlapped ov = new Overlapped(0, 0, IntPtr.Zero, asyncResult);
-            NativeOverlapped* ovNative = ov.UnsafePack(callback, IntPtr.Zero);
-            UnmanagedMemoryStream stream = new UnmanagedMemoryStream((byte*)sourceAddress, numBytesToWrite);
-            blob.BeginWritePages(stream, (long)destinationAddress, null, ar =>
+            if (blobEntry.PageBlob == null
+                && blobEntry.TryQueueAction(p => this.WriteToBlobAsync(p, sourceAddress, destinationAddress, numBytesToWrite, callback, context)))
             {
-                try
-                {
-                    blob.EndWritePages(ar);
-                }
-                // I don't think I can be more specific in catch here because no documentation on exception behavior is provided
-                catch (Exception e)
-                {
-                    Trace.TraceError(e.Message);
-                    // Is there any documentation on the meaning of error codes here? The handler suggests that any non-zero value is an error
-                    // but does not distinguish between them.
-                    callback(1, numBytesToWrite, ovNative);
-                }
-                callback(0, numBytesToWrite, ovNative);
-            }, asyncResult);
+                return;
+            }
+            // Otherwise, invoke directly.
+            this.WriteToBlobAsync(blobEntry.PageBlob, sourceAddress, destinationAddress, numBytesToWrite, callback, context);
         }
 
-        private string GetSegmentBlobName(int segmentId)
+        private unsafe void WriteToBlobAsync(CloudPageBlob blob, IntPtr sourceAddress, ulong destinationAddress, uint numBytesToWrite, DeviceIOCompletionCallback callback, object context)
         {
-            return blobName + segmentId;
+            this.WriteToBlobAsync(blob, sourceAddress, (long)destinationAddress, numBytesToWrite)
+                .ContinueWith((Task t) =>
+                {
+                    if (t.IsFaulted)
+                    {
+                        Debug.WriteLine("AzureStorageDevice.WriteAsync Returned (Failure)");
+                        callback(uint.MaxValue, numBytesToWrite, context);
+                    }
+                    else
+                    {
+                        Debug.WriteLine("AzureStorageDevice.WriteAsync Returned");
+                        callback(0, numBytesToWrite, context);
+                    }
+                });
+        }
+
+        private async Task WriteToBlobAsync(CloudPageBlob blob, IntPtr sourceAddress, long destinationAddress, uint numBytesToWrite)
+        {
+            long offset = 0;
+            while (numBytesToWrite > 0)
+            {
+                var length = Math.Min(numBytesToWrite, MAX_UPLOAD_SIZE);
+                await this.WritePortionToBlobUnsafeAsync(blob, sourceAddress, destinationAddress, offset, length).ConfigureAwait(false);
+                numBytesToWrite -= length;
+                offset += length;
+            }
+        }
+
+        private static bool IsTransientStorageError(StorageException e)
+        {
+            return (e.RequestInformation.HttpStatusCode == 408)  //408 Request Timeout
+                || (e.RequestInformation.HttpStatusCode == 429)  //429 Too Many Requests
+                || (e.RequestInformation.HttpStatusCode == 500)  //500 Internal Server Error
+                || (e.RequestInformation.HttpStatusCode == 502)  //502 Bad Gateway
+                || (e.RequestInformation.HttpStatusCode == 503)  //503 Service Unavailable
+                || (e.RequestInformation.HttpStatusCode == 504); //504 Gateway Timeout
+        }
+
+        private static bool IsFatal(Exception exception)
+        {
+            if (exception is OutOfMemoryException || exception is StackOverflowException)
+            {
+                return true;
+            }
+            return false;
         }
     }
 }

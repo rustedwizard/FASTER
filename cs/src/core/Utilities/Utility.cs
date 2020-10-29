@@ -2,6 +2,7 @@
 // Licensed under the MIT license.
 
 using System;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -12,12 +13,12 @@ namespace FASTER.core
     /// <summary>
     /// Empty type
     /// </summary>
-    public struct Empty
+    public readonly struct Empty
     {
         /// <summary>
         /// Default
         /// </summary>
-        public static readonly Empty Default = default(Empty);
+        public static readonly Empty Default = default;
     }
 
     /// <summary>
@@ -35,6 +36,13 @@ namespace FASTER.core
         {
             T[] arr = new T[2];
             return (int)((long)Unsafe.AsPointer(ref arr[1]) - (long)Unsafe.AsPointer(ref arr[0]));
+        }
+
+        internal static bool IsBlittableType(Type t)
+        {
+            var mi = typeof(Utility).GetMethod("IsBlittable", BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.InvokeMethod);
+            var fooRef = mi.MakeGenericMethod(t);
+            return (bool)fooRef.Invoke(null, null);
         }
 
         /// <summary>
@@ -300,22 +308,22 @@ namespace FASTER.core
                 return Task.FromCanceled<T>(token);
             }
 
-            return Inner(task, token, useSynchronizationContext, continueOnCapturedContext);
+            return SlowWithCancellationAsync(task, token, useSynchronizationContext, continueOnCapturedContext);
+        }
 
-            static async Task<T> Inner(Task<T> task, CancellationToken token, bool useSynchronizationContext, bool continueOnCapturedContext)
+        private static async Task<T> SlowWithCancellationAsync<T>(Task<T> task, CancellationToken token, bool useSynchronizationContext, bool continueOnCapturedContext)
+        {
+            var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            using (token.Register(s => ((TaskCompletionSource<bool>)s).TrySetResult(true), tcs, useSynchronizationContext))
             {
-                var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-                using (token.Register(s => ((TaskCompletionSource<bool>)s).TrySetResult(true), tcs, useSynchronizationContext))
+                if (task != await Task.WhenAny(task, tcs.Task))
                 {
-                    if (task != await Task.WhenAny(task, tcs.Task))
-                    {
-                        token.ThrowIfCancellationRequested();
-                    }
+                    token.ThrowIfCancellationRequested();
                 }
-
-                // make sure any exceptions in the task get unwrapped and exposed to the caller.
-                return await task.ConfigureAwait(continueOnCapturedContext);
             }
+
+            // make sure any exceptions in the task get unwrapped and exposed to the caller.
+            return await task.ConfigureAwait(continueOnCapturedContext);
         }
     }
 }

@@ -3,7 +3,6 @@
 
 using System;
 using System.Buffers;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
@@ -15,7 +14,7 @@ namespace FASTER.core
     /// <summary>
     /// Scan iterator for hybrid log
     /// </summary>
-    public class FasterLogScanIterator : IDisposable
+    public sealed class FasterLogScanIterator : IDisposable
     {
         private readonly int frameSize;
         private readonly string name;
@@ -30,6 +29,7 @@ namespace FASTER.core
         private readonly LightEpoch epoch;
         private readonly GetMemory getMemory;
         private readonly int headerSize;
+        private readonly bool scanUncommitted;
         private bool disposed = false;
         internal long requestedCompletedUntilAddress;
 
@@ -55,13 +55,15 @@ namespace FASTER.core
         /// <param name="headerSize"></param>
         /// <param name="name"></param>
         /// <param name="getMemory"></param>
-        internal unsafe FasterLogScanIterator(FasterLog fasterLog, BlittableAllocator<Empty, byte> hlog, long beginAddress, long endAddress, GetMemory getMemory, ScanBufferingMode scanBufferingMode, LightEpoch epoch, int headerSize, string name)
+        /// <param name="scanUncommitted"></param>
+        internal unsafe FasterLogScanIterator(FasterLog fasterLog, BlittableAllocator<Empty, byte> hlog, long beginAddress, long endAddress, GetMemory getMemory, ScanBufferingMode scanBufferingMode, LightEpoch epoch, int headerSize, string name, bool scanUncommitted = false)
         {
             this.fasterLog = fasterLog;
             this.allocator = hlog;
             this.getMemory = getMemory;
             this.epoch = epoch;
             this.headerSize = headerSize;
+            this.scanUncommitted = scanUncommitted;
 
             if (beginAddress == 0)
                 beginAddress = hlog.GetFirstValidLogicalAddress(0);
@@ -97,44 +99,46 @@ namespace FASTER.core
         /// <summary>
         /// Async enumerable for iterator
         /// </summary>
-        /// <returns>Entry, entry length, entry address</returns>
-        public async IAsyncEnumerable<(byte[], int, long)> GetAsyncEnumerable([EnumeratorCancellation] CancellationToken token = default)
+        /// <returns>Entry, actual entry length, logical address of entry, logical address of next entry</returns>
+        public async IAsyncEnumerable<(byte[] entry, int entryLength, long currentAddress, long nextAddress)> GetAsyncEnumerable([EnumeratorCancellation] CancellationToken token = default)
         {
             while (!disposed)
             {
                 byte[] result;
                 int length;
                 long currentAddress;
-                while (!GetNext(out result, out length, out currentAddress))
+                long nextAddress;
+                while (!GetNext(out result, out length, out currentAddress, out nextAddress))
                 {
                     if (currentAddress >= endAddress)
                         yield break;
                     if (!await WaitAsync(token))
                         yield break;
                 }
-                yield return (result, length, currentAddress);
+                yield return (result, length, currentAddress, nextAddress);
             }
         }
 
         /// <summary>
         /// Async enumerable for iterator (memory pool based version)
         /// </summary>
-        /// <returns>Entry, entry length, entry address</returns>
-        public async IAsyncEnumerable<(IMemoryOwner<byte>, int, long)> GetAsyncEnumerable(MemoryPool<byte> pool, [EnumeratorCancellation] CancellationToken token = default)
+        /// <returns>Entry, actual entry length, logical address of entry, logical address of next entry</returns>
+        public async IAsyncEnumerable<(IMemoryOwner<byte>, int entryLength, long currentAddress, long nextAddress)> GetAsyncEnumerable(MemoryPool<byte> pool, [EnumeratorCancellation] CancellationToken token = default)
         {
             while (!disposed)
             {
                 IMemoryOwner<byte> result;
                 int length;
                 long currentAddress;
-                while (!GetNext(pool, out result, out length, out currentAddress))
+                long nextAddress;
+                while (!GetNext(pool, out result, out length, out currentAddress, out nextAddress))
                 {
                     if (currentAddress >= endAddress)
                         yield break;
                     if (!await WaitAsync(token))
                         yield break;
                 }
-                yield return (result, length, currentAddress);
+                yield return (result, length, currentAddress, nextAddress);
             }
         }
 #endif
@@ -147,32 +151,58 @@ namespace FASTER.core
         {
             token.ThrowIfCancellationRequested();
 
-            // if (nextAddress >= this.endAddress)
-            //    return new ValueTask<bool>(false);
-
-            if (NextAddress < fasterLog.CommittedUntilAddress)
-                return new ValueTask<bool>(true);
-
-            return SlowWaitAsync(this, token);
-
-            // use static local function to guarantee there's no accidental closure getting allocated here
-            static async ValueTask<bool> SlowWaitAsync(FasterLogScanIterator @this, CancellationToken token)
+            if (!scanUncommitted)
             {
-                while (true)
+                if (NextAddress < fasterLog.CommittedUntilAddress)
+                    return new ValueTask<bool>(true);
+
+                return SlowWaitAsync(this, token);
+            }
+            else
+            {
+                if (NextAddress < fasterLog.SafeTailAddress)
+                    return new ValueTask<bool>(true);
+
+                return SlowWaitUncommittedAsync(this, token);
+            }
+        }
+
+        private static async ValueTask<bool> SlowWaitAsync(FasterLogScanIterator @this, CancellationToken token)
+        {
+            while (true)
+            {
+                if (@this.disposed)
+                    return false;
+                var commitTask = @this.fasterLog.CommitTask;
+                if (@this.NextAddress < @this.fasterLog.CommittedUntilAddress)
+                    return true;
+                // Ignore commit exceptions, except when the token is signaled
+                try
                 {
-                    if (@this.disposed)
-                        return false;
-                    var commitTask = @this.fasterLog.CommitTask;
-                    if (@this.NextAddress < @this.fasterLog.CommittedUntilAddress)
-                        return true;
-                    // Ignore commit exceptions, except when the token is signaled
-                    try
-                    {
-                        await commitTask.WithCancellationAsync(token);
-                    }
-                    catch (ObjectDisposedException) { return false; }
-                    catch when (!token.IsCancellationRequested) { }
+                    await commitTask.WithCancellationAsync(token);
                 }
+                catch (ObjectDisposedException) { return false; }
+                catch when (!token.IsCancellationRequested) { }
+            }
+        }
+
+        private static async ValueTask<bool> SlowWaitUncommittedAsync(FasterLogScanIterator @this, CancellationToken token)
+        {
+            while (true)
+            {
+                if (@this.disposed)
+                    return false;
+                var refreshUncommittedTask = @this.fasterLog.RefreshUncommittedTask;
+                if (@this.NextAddress < @this.fasterLog.SafeTailAddress)
+                    return true;
+
+                // Ignore refresh-uncommitted exceptions, except when the token is signaled
+                try
+                {
+                    await refreshUncommittedTask.WithCancellationAsync(token);
+                }
+                catch (ObjectDisposedException) { return false; }
+                catch when (!token.IsCancellationRequested) { }
             }
         }
 
@@ -185,8 +215,21 @@ namespace FASTER.core
         /// <returns></returns>
         public unsafe bool GetNext(out byte[] entry, out int entryLength, out long currentAddress)
         {
+            return GetNext(out entry, out entryLength, out currentAddress, out _);
+        }
+
+        /// <summary>
+        /// Get next record in iterator
+        /// </summary>
+        /// <param name="entry">Copy of entry, if found</param>
+        /// <param name="entryLength">Actual length of entry</param>
+        /// <param name="currentAddress">Logical address of entry</param>
+        /// <param name="nextAddress">Logical address of next entry</param>
+        /// <returns></returns>
+        public unsafe bool GetNext(out byte[] entry, out int entryLength, out long currentAddress, out long nextAddress)
+        {
             epoch.Resume();
-            if (GetNextInternal(out long physicalAddress, out entryLength, out currentAddress))
+            if (GetNextInternal(out long physicalAddress, out entryLength, out currentAddress, out nextAddress))
             {
                 if (getMemory != null)
                 {
@@ -223,8 +266,22 @@ namespace FASTER.core
         /// <returns></returns>
         public unsafe bool GetNext(MemoryPool<byte> pool, out IMemoryOwner<byte> entry, out int entryLength, out long currentAddress)
         {
+            return GetNext(pool, out entry, out entryLength, out currentAddress, out _);
+        }
+
+        /// <summary>
+        /// GetNext supporting memory pools
+        /// </summary>
+        /// <param name="pool">Memory pool</param>
+        /// <param name="entry">Copy of entry, if found</param>
+        /// <param name="entryLength">Actual length of entry</param>
+        /// <param name="currentAddress">Logical address of entry</param>
+        /// <param name="nextAddress">Logical address of next entry</param>
+        /// <returns></returns>
+        public unsafe bool GetNext(MemoryPool<byte> pool, out IMemoryOwner<byte> entry, out int entryLength, out long currentAddress, out long nextAddress)
+        {
             epoch.Resume();
-            if (GetNextInternal(out long physicalAddress, out entryLength, out currentAddress))
+            if (GetNextInternal(out long physicalAddress, out entryLength, out currentAddress, out nextAddress))
             {
                 entry = pool.Rent(entryLength);
 
@@ -297,22 +354,34 @@ namespace FASTER.core
             {
                 var nextPage = currentPage + i;
 
+                var pageEndAddress = (nextPage + 1 ) << allocator.LogPageSizeBits;
+
+                if (fasterLog.readOnlyMode)
+                {
+                    // Support partial page reads of committed data
+                    var _flush = fasterLog.CommittedUntilAddress;
+                    if (_flush < pageEndAddress)
+                    {
+                        pageEndAddress = _flush;
+                    }
+                }
+
                 // Cannot load page if its not fully written to storage
-                if (headAddress < (nextPage + 1) << allocator.LogPageSizeBits)
+                if (headAddress < pageEndAddress)
                     continue;
 
                 var nextFrame = (currentFrame + i) % frameSize;
 
                 long val;
-                while ((val = nextLoadedPage[nextFrame]) < nextPage || loadedPage[nextFrame] < nextPage)
+                while ((val = nextLoadedPage[nextFrame]) < pageEndAddress || loadedPage[nextFrame] < pageEndAddress)
                 {
-                    if (val < nextPage && Interlocked.CompareExchange(ref nextLoadedPage[nextFrame], nextPage, val) == val)
+                    if (val < pageEndAddress && Interlocked.CompareExchange(ref nextLoadedPage[nextFrame], pageEndAddress, val) == val)
                     {
                         var tmp_i = i;
                         epoch.BumpCurrentEpoch(() =>
                         {
                             allocator.AsyncReadPagesFromDeviceToFrame(tmp_i + (currentAddress >> allocator.LogPageSizeBits), 1, endAddress, AsyncReadPagesCallback, Empty.Default, frame, out loaded[nextFrame], 0, null, null, loadedCancel[nextFrame]);
-                            loadedPage[nextFrame] = nextPage;
+                            loadedPage[nextFrame] = pageEndAddress;
                         });
                     }
                     else
@@ -342,15 +411,15 @@ namespace FASTER.core
             return true;
         }
 
-        private unsafe void AsyncReadPagesCallback(uint errorCode, uint numBytes, NativeOverlapped* overlap)
+        private unsafe void AsyncReadPagesCallback(uint errorCode, uint numBytes, object context)
         {
             try
             {
-                var result = (PageAsyncReadResult<Empty>)Overlapped.Unpack(overlap).AsyncResult;
+                var result = (PageAsyncReadResult<Empty>)context;
 
                 if (errorCode != 0)
                 {
-                    Trace.TraceError("OverlappedStream GetQueuedCompletionStatus error: {0}", errorCode);
+                    Trace.TraceError("AsyncReadPagesCallback error: {0}", errorCode);
                     result.cts?.Cancel();
                 }
 
@@ -368,10 +437,6 @@ namespace FASTER.core
                 Interlocked.MemoryBarrier();
             }
             catch when (disposed) { }
-            finally
-            {
-                Overlapped.Free(overlap);
-            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -387,14 +452,16 @@ namespace FASTER.core
         /// <param name="physicalAddress"></param>
         /// <param name="entryLength"></param>
         /// <param name="currentAddress"></param>
+        /// <param name="nextAddress"></param>
         /// <returns></returns>
-        private unsafe bool GetNextInternal(out long physicalAddress, out int entryLength, out long currentAddress)
+        private unsafe bool GetNextInternal(out long physicalAddress, out int entryLength, out long currentAddress, out long nextAddress)
         {
             while (true)
             {
                 physicalAddress = 0;
                 entryLength = 0;
                 currentAddress = NextAddress;
+                nextAddress = NextAddress;
 
                 // Check for boundary conditions
                 if (currentAddress < allocator.BeginAddress)
@@ -411,7 +478,7 @@ namespace FASTER.core
                     return false;
 
 
-                if ((currentAddress >= endAddress) || (currentAddress >= fasterLog.CommittedUntilAddress))
+                if ((currentAddress >= endAddress) || (currentAddress >= (scanUncommitted ? fasterLog.SafeTailAddress : fasterLog.CommittedUntilAddress)))
                 {
                     return false;
                 }
@@ -483,6 +550,7 @@ namespace FASTER.core
 
                 if (Utility.MonotonicUpdate(ref NextAddress, currentAddress, out long oldCurrentAddress))
                 {
+                    nextAddress = currentAddress;
                     currentAddress = oldCurrentAddress;
                     return true;
                 }
@@ -490,5 +558,3 @@ namespace FASTER.core
         }
     }
 }
-
-
