@@ -33,12 +33,12 @@ namespace FASTER.test.statemachine
                 inputArray[i].adId = i;
             }
 
-            log = Devices.CreateLogDevice(TestContext.CurrentContext.TestDirectory + "\\StateMachineTest1.log", deleteOnClose: true);
-            Directory.CreateDirectory(TestContext.CurrentContext.TestDirectory + "\\checkpoints4");
+            log = Devices.CreateLogDevice(TestContext.CurrentContext.TestDirectory + "/StateMachineTest1.log", deleteOnClose: true);
+            Directory.CreateDirectory(TestContext.CurrentContext.TestDirectory + "/checkpoints4");
             fht1 = new FasterKV<AdId, NumClicks>
                 (128,
                 logSettings: new LogSettings { LogDevice = log, MutableFraction = 0.1, PageSizeBits = 10, MemorySizeBits = 13 },
-                checkpointSettings: new CheckpointSettings { CheckpointDir = TestContext.CurrentContext.TestDirectory + "\\checkpoints4", CheckPointType = CheckpointType.FoldOver }
+                checkpointSettings: new CheckpointSettings { CheckpointDir = TestContext.CurrentContext.TestDirectory + "/checkpoints4", CheckPointType = CheckpointType.FoldOver }
                 );
         }
 
@@ -47,7 +47,7 @@ namespace FASTER.test.statemachine
         {
             fht1.Dispose();
             log.Dispose();
-            new DirectoryInfo(TestContext.CurrentContext.TestDirectory + "\\checkpoints4").Delete(true);
+            new DirectoryInfo(TestContext.CurrentContext.TestDirectory + "/checkpoints4").Delete(true);
         }
 
 
@@ -358,7 +358,7 @@ namespace FASTER.test.statemachine
 
             NumClicks value;
 
-            s1 = fht1.For<NumClicks, NumClicks, Empty>().NewSession(f, "foo", threadAffinitized: true);
+            s1 = fht1.For(f).NewSession<SimpleFunctions>("foo", threadAffinitized: true);
 
             for (int key = 0; key < numOps; key++)
             {
@@ -370,7 +370,7 @@ namespace FASTER.test.statemachine
             fht1.Log.ShiftReadOnlyAddress(fht1.Log.TailAddress, true);
 
             // Start affinitized session s2 on another thread for testing
-            s2 = fht1.For<NumClicks, NumClicks, Empty>().CreateThreadSession(f, threadAffinized: true);
+            s2 = fht1.For(f).CreateThreadSession(f, threadAffinized: true);
 
             // We should be in REST, 1
             Assert.IsTrue(SystemState.Equal(SystemState.Make(Phase.REST, 1), fht1.SystemState));
@@ -391,7 +391,7 @@ namespace FASTER.test.statemachine
                 <AdId, NumClicks>
                 (128,
                 logSettings: new LogSettings { LogDevice = log, MutableFraction = 0.1, PageSizeBits = 10, MemorySizeBits = 13 },
-                checkpointSettings: new CheckpointSettings { CheckpointDir = TestContext.CurrentContext.TestDirectory + "\\checkpoints4", CheckPointType = CheckpointType.FoldOver }
+                checkpointSettings: new CheckpointSettings { CheckpointDir = TestContext.CurrentContext.TestDirectory + "/checkpoints4", CheckPointType = CheckpointType.FoldOver }
                 );
 
             fht2.Recover(); // sync, does not require session

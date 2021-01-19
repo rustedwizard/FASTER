@@ -552,6 +552,10 @@ namespace FASTER.core
 
             device = settings.LogDevice;
             sectorSize = (int)device.SectorSize;
+
+            if (PageSize < sectorSize)
+                throw new FasterException($"Page size must be at least of device sector size ({sectorSize} bytes). Set PageSizeBits accordingly.");
+
             AlignedPageSizeBytes = ((PageSize + (sectorSize - 1)) & ~(sectorSize - 1));
         }
 
@@ -600,24 +604,6 @@ namespace FASTER.core
 
             TailPageOffset.Page = (int)(firstValidAddress >> LogPageSizeBits);
             TailPageOffset.Offset = (int)(firstValidAddress & PageSizeMask);
-        }
-
-        /// <summary>
-        /// Acquire thread
-        /// </summary>
-        public void Acquire()
-        {
-            if (ownedEpoch)
-                epoch.Resume();
-        }
-
-        /// <summary>
-        /// Release thread
-        /// </summary>
-        public void Release()
-        {
-            if (ownedEpoch)
-                epoch.Suspend();
         }
 
         /// <summary>
@@ -859,7 +845,7 @@ namespace FASTER.core
             epoch.Suspend();
 
             // Wait for flush to complete
-            while (FlushedUntilAddress < newBeginAddress) ;
+            while (FlushedUntilAddress < newBeginAddress) Thread.Yield();
 
             // Then shift head address
             var h = Utility.MonotonicUpdate(ref HeadAddress, newBeginAddress, out long old);
@@ -1494,7 +1480,8 @@ namespace FASTER.core
                     // We have the complete record.
                     if (RetrievedFullRecord(record, ref ctx))
                     {
-                        if (comparer.Equals(ref ctx.request_key.Get(), ref GetContextRecordKey(ref ctx)))
+                        // ReadAtAddress does not have a request key, so it is an implicit match.
+                        if (ctx.request_key is null || comparer.Equals(ref ctx.request_key.Get(), ref GetContextRecordKey(ref ctx)))
                         {
                             // The keys are same, so I/O is complete
                             // ctx.record = result.record;

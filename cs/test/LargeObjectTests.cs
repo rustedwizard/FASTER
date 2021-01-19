@@ -27,7 +27,7 @@ namespace FASTER.test.largeobjects
         {
             if (test_path == null)
             {
-                test_path = TestContext.CurrentContext.TestDirectory + "\\" + Path.GetRandomFileName();
+                test_path = TestContext.CurrentContext.TestDirectory + "/" + Path.GetRandomFileName();
                 if (!Directory.Exists(test_path))
                     Directory.CreateDirectory(test_path);
             }
@@ -36,28 +36,7 @@ namespace FASTER.test.largeobjects
         [TearDown]
         public void TearDown()
         {
-            DeleteDirectory(test_path);
-        }
-
-        public static void DeleteDirectory(string path)
-        {
-            foreach (string directory in Directory.GetDirectories(path))
-            {
-                DeleteDirectory(directory);
-            }
-
-            try
-            {
-                Directory.Delete(path, true);
-            }
-            catch (IOException)
-            {
-                Directory.Delete(path, true);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                Directory.Delete(path, true);
-            }
+            Directory.Delete(test_path, true);
         }
 
         [TestCase(CheckpointType.FoldOver)]
@@ -67,8 +46,8 @@ namespace FASTER.test.largeobjects
             MyInput input = default;
             MyLargeOutput output = new MyLargeOutput();
 
-            log = Devices.CreateLogDevice(test_path + "\\LargeObjectTest.log");
-            objlog = Devices.CreateLogDevice(test_path + "\\LargeObjectTest.obj.log");
+            log = Devices.CreateLogDevice(test_path + "/LargeObjectTest.log");
+            objlog = Devices.CreateLogDevice(test_path + "/LargeObjectTest.obj.log");
 
             fht1 = new FasterKV<MyKey, MyLargeValue>
                 (128,
@@ -96,8 +75,8 @@ namespace FASTER.test.largeobjects
             log.Dispose();
             objlog.Dispose();
 
-            log = Devices.CreateLogDevice(test_path + "\\LargeObjectTest.log");
-            objlog = Devices.CreateLogDevice(test_path + "\\LargeObjectTest.obj.log");
+            log = Devices.CreateLogDevice(test_path + "/LargeObjectTest.log");
+            objlog = Devices.CreateLogDevice(test_path + "/LargeObjectTest.obj.log");
 
             fht2 = new FasterKV<MyKey, MyLargeValue>
                 (128,

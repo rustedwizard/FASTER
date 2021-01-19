@@ -3,10 +3,10 @@
 
 using System;
 using System.Collections.Generic;
-using System.Linq;
 using System.IO;
 using FASTER.core;
 using NUnit.Framework;
+using System.Threading.Tasks;
 
 namespace FASTER.test.recovery.sumstore
 {
@@ -29,12 +29,12 @@ namespace FASTER.test.recovery.sumstore
         {
             if (test_path == null)
             {
-                test_path = TestContext.CurrentContext.TestDirectory + "\\" + Path.GetRandomFileName();
+                test_path = TestContext.CurrentContext.TestDirectory + "/" + Path.GetRandomFileName();
                 if (!Directory.Exists(test_path))
                     Directory.CreateDirectory(test_path);
             }
 
-            log = Devices.CreateLogDevice(test_path + "\\FullRecoveryTests.log");
+            log = Devices.CreateLogDevice(test_path + "/FullRecoveryTests.log");
 
             fht = new FasterKV<AdId, NumClicks>
             (keySpace,
@@ -49,32 +49,11 @@ namespace FASTER.test.recovery.sumstore
             fht.Dispose();
             fht = null;
             log.Dispose();
-            DeleteDirectory(test_path);
-        }
-
-        public static void DeleteDirectory(string path)
-        {
-            foreach (string directory in Directory.GetDirectories(path))
-            {
-                DeleteDirectory(directory);
-            }
-
-            try
-            {
-                Directory.Delete(path, true);
-            }
-            catch (IOException)
-            {
-                Directory.Delete(path, true);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                Directory.Delete(path, true);
-            }
+            Directory.Delete(test_path, true);
         }
 
         [Test]
-        public void RecoveryTestSeparateCheckpoint()
+        public async ValueTask RecoveryTestSeparateCheckpoint([Values]bool isAsync)
         {
             Populate(SeparateCheckpointAction);
 
@@ -85,12 +64,12 @@ namespace FASTER.test.recovery.sumstore
                 fht = null;
                 log.Dispose();
                 Setup();
-                RecoverAndTest(logTokens[i], indexTokens[i]);
+                await RecoverAndTestAsync(logTokens[i], indexTokens[i], isAsync);
             }
         }
 
         [Test]
-        public void RecoveryTestFullCheckpoint()
+        public async ValueTask RecoveryTestFullCheckpoint([Values] bool isAsync)
         {
             Populate(FullCheckpointAction);
 
@@ -100,7 +79,7 @@ namespace FASTER.test.recovery.sumstore
                 fht = null;
                 log.Dispose();
                 Setup();
-                RecoverAndTest(token, token);
+                await RecoverAndTestAsync(token, token, isAsync);
             }
         }
 
@@ -182,10 +161,13 @@ namespace FASTER.test.recovery.sumstore
             session.Dispose();
         }
 
-        public void RecoverAndTest(Guid cprVersion, Guid indexVersion)
+        public async ValueTask RecoverAndTestAsync(Guid cprVersion, Guid indexVersion, bool isAsync)
         {
             // Recover
-            fht.Recover(indexVersion, cprVersion);
+            if (isAsync)
+                await fht.RecoverAsync(indexVersion, cprVersion);
+            else
+                fht.Recover(indexVersion, cprVersion);
 
             // Create array for reading
             var inputArray = new AdInput[numUniqueKeys];

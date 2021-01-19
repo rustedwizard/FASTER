@@ -10,7 +10,6 @@ using FASTER.core;
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.Net;
 using System.Runtime.InteropServices;
 using System.Threading;
 
@@ -85,6 +84,10 @@ namespace FASTER.benchmark
 
         public FASTER_YcsbBenchmark(int threadCount_, int numaStyle_, string distribution_, int readPercent_, int backupOptions_)
         {
+            // Pin loading thread if it is not used for checkpointing
+            if (kPeriodicCheckpointMilliseconds <= 0)
+                Native32.AffinitizeThreadShardedNuma(0, 2);
+
             threadCount = threadCount_;
             numaStyle = numaStyle_;
             distribution = distribution_;
@@ -231,8 +234,6 @@ namespace FASTER.benchmark
 
         public unsafe void Run()
         {
-            //Native32.AffinitizeThreadShardedNuma(0, 2);
-
             RandomGenerator rng = new RandomGenerator();
 
             LoadData();
@@ -254,6 +255,7 @@ namespace FASTER.benchmark
             var storeWasRecovered = false;
             if (this.backupMode.HasFlag(BackupMode.Restore) && kPeriodicCheckpointMilliseconds <= 0)
             {
+                Console.WriteLine("Recovering store for fast restart");
                 sw.Start();
                 try
                 {
@@ -498,8 +500,8 @@ namespace FASTER.benchmark
 
         private unsafe void LoadDataFromFile(string filePath)
         {
-            string init_filename = filePath + "\\load_" + distribution + "_250M_raw.dat";
-            string txn_filename = filePath + "\\run_" + distribution + "_250M_1000M_raw.dat";
+            string init_filename = filePath + "/load_" + distribution + "_250M_raw.dat";
+            string txn_filename = filePath + "/run_" + distribution + "_250M_1000M_raw.dat";
 
             long count = 0;
             using (FileStream stream = File.Open(init_filename, FileMode.Open, FileAccess.Read,

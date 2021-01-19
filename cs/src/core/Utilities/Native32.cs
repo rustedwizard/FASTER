@@ -266,38 +266,50 @@ namespace FASTER.core
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern SafeFileHandle CreateFile(string filename, uint access, uint share, IntPtr securityAttributes, uint creationDisposition, uint flagsAndAttributes, IntPtr templateFile);
 
+        private static bool? processPrivilegeEnabled = null;
+
         /// <summary>
         /// Enable privilege for process
         /// </summary>
         /// <returns></returns>
         public static bool EnableProcessPrivileges()
         {
-#if DOTNETCORE
+#if NETSTANDARD
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return false;
 #endif
+            if (processPrivilegeEnabled.HasValue) return processPrivilegeEnabled.Value;
 
             TOKEN_PRIVILEGES token_privileges = default(TOKEN_PRIVILEGES);
             token_privileges.PrivilegeCount = 1;
             token_privileges.Privileges.Attributes = 0x2;
 
             if (!LookupPrivilegeValue(null, "SeManageVolumePrivilege",
-                ref token_privileges.Privileges.Luid)) return false;
+                ref token_privileges.Privileges.Luid))
+            {
+                processPrivilegeEnabled = false;
+                return false;
+            }
 
             if (!OpenProcessToken(GetCurrentProcess(), 0x20, out IntPtr token))
+            {
+                processPrivilegeEnabled = false;
                 return false;
-
+            }
             if (!AdjustTokenPrivileges(token, 0, ref token_privileges, 0, 0, 0))
             {
                 CloseHandle(token);
+                processPrivilegeEnabled = false;
                 return false;
             }
             if (Marshal.GetLastWin32Error() != 0)
             {
                 CloseHandle(token);
+                processPrivilegeEnabled = false;
                 return false;
             }
             CloseHandle(token);
+            processPrivilegeEnabled = true;
             return true;
         }
 
@@ -308,10 +320,12 @@ namespace FASTER.core
 
         internal static bool EnableVolumePrivileges(string filename, SafeFileHandle handle)
         {
-#if DOTNETCORE
+#if NETSTANDARD
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return false;
 #endif
+            if (processPrivilegeEnabled == false)
+                return false;
 
             string volume_string = "\\\\.\\" + filename.Substring(0, 2);
 
@@ -346,7 +360,7 @@ namespace FASTER.core
         /// <returns></returns>
         public static bool SetFileSize(SafeFileHandle file_handle, long file_size)
         {
-#if DOTNETCORE
+#if NETSTANDARD
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return false;
 #endif

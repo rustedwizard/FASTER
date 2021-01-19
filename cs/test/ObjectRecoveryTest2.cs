@@ -5,12 +5,12 @@ using FASTER.core;
 using System;
 using System.IO;
 using NUnit.Framework;
+using System.Threading.Tasks;
 
 namespace FASTER.test.recovery.objects
 {
-
     [TestFixture]
-    public class ObjectRecoveryTest
+    public class ObjectRecoveryTests2
     {
         int iterations;
         string FasterFolderPath { get; set; }
@@ -18,7 +18,7 @@ namespace FASTER.test.recovery.objects
         [SetUp]
         public void Setup()
         {
-            FasterFolderPath = TestContext.CurrentContext.TestDirectory + "\\" + Path.GetRandomFileName();
+            FasterFolderPath = TestContext.CurrentContext.TestDirectory + "/" + Path.GetRandomFileName();
             if (!Directory.Exists(FasterFolderPath))
                 Directory.CreateDirectory(FasterFolderPath);
         }
@@ -26,35 +26,14 @@ namespace FASTER.test.recovery.objects
         [TearDown]
         public void TearDown()
         {
-            DeleteDirectory(FasterFolderPath);
+            Directory.Delete(FasterFolderPath, true);
         }
-
-        public static void DeleteDirectory(string path)
-        {
-            foreach (string directory in Directory.GetDirectories(path))
-            {
-                DeleteDirectory(directory);
-            }
-
-            try
-            {
-                Directory.Delete(path, true);
-            }
-            catch (IOException)
-            {
-                Directory.Delete(path, true);
-            }
-            catch (UnauthorizedAccessException)
-            {
-                Directory.Delete(path, true);
-            }
-        }
-
 
         [Test]
-        public void ObjectRecoveryTest1(
+        public async ValueTask ObjectRecoveryTest2(
             [Values]CheckpointType checkpointType,
-            [Range(100, 1500, 600)] int iterations)
+            [Range(100, 700, 300)] int iterations,
+            [Values]bool isAsync)
         {
             this.iterations = iterations;
             Prepare(checkpointType, out _, out _, out IDevice log, out IDevice objlog, out FasterKV<MyKey, MyValue> h, out MyContext context);
@@ -71,7 +50,10 @@ namespace FASTER.test.recovery.objects
 
             Prepare(checkpointType, out _, out _, out log, out objlog, out h, out context);
 
-            h.Recover();
+            if (isAsync)
+                await h.RecoverAsync();
+            else
+                h.Recover();
 
             var session2 = h.For(new MyFunctions()).NewSession<MyFunctions>();
             Read(session2, context, true);

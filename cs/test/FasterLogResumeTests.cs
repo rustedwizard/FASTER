@@ -19,10 +19,10 @@ namespace FASTER.test
         [SetUp]
         public void Setup()
         {
-            commitPath = TestContext.CurrentContext.TestDirectory + "\\" + TestContext.CurrentContext.Test.Name + "\\";
+            commitPath = TestContext.CurrentContext.TestDirectory + "/" + TestContext.CurrentContext.Test.Name + "/";
 
             if (Directory.Exists(commitPath))
-                DeleteDirectory(commitPath);
+                Directory.Delete(commitPath, true);
 
             device = Devices.CreateLogDevice(commitPath + "fasterlog.log", deleteOnClose: true);
         }
@@ -33,7 +33,7 @@ namespace FASTER.test
             device.Dispose();
 
             if (Directory.Exists(commitPath))
-                DeleteDirectory(commitPath);
+                Directory.Delete(commitPath, true);
         }
 
         [Test]
@@ -51,22 +51,18 @@ namespace FASTER.test
                 await l.EnqueueAsync(input3);
                 await l.CommitAsync();
 
-                using (var originalIterator = l.Scan(0, long.MaxValue, readerName))
-                {
-                    originalIterator.GetNext(out _, out _, out _, out long recoveryAddress);
-                    originalIterator.CompleteUntil(recoveryAddress);
-                    originalIterator.GetNext(out _, out _, out _, out _);  // move the reader ahead
-                    await l.CommitAsync();
-                }
+                using var originalIterator = l.Scan(0, long.MaxValue, readerName);
+                Assert.IsTrue(originalIterator.GetNext(out _, out _, out _, out long recoveryAddress));
+                originalIterator.CompleteUntil(recoveryAddress);
+                Assert.IsTrue(originalIterator.GetNext(out _, out _, out _, out _));  // move the reader ahead
+                await l.CommitAsync();
             }
 
             using (var l = new FasterLog(new FasterLogSettings { LogDevice = device, PageSizeBits = 16, MemorySizeBits = 16, LogChecksum = logChecksum, LogCommitFile = commitPath }))
             {
-                using (var recoveredIterator = l.Scan(0, long.MaxValue, readerName))
-                {
-                    recoveredIterator.GetNext(out byte[] outBuf, out _, out _, out _);
-                    Assert.True(input2.SequenceEqual(outBuf));  // we should have read in input2, not input1 or input3
-                }
+                using var recoveredIterator = l.Scan(0, long.MaxValue, readerName);
+                Assert.IsTrue(recoveredIterator.GetNext(out byte[] outBuf, out _, out _, out _));
+                Assert.True(input2.SequenceEqual(outBuf));  // we should have read in input2, not input1 or input3
             }
         }
 
@@ -92,57 +88,24 @@ namespace FASTER.test
                     await l.EnqueueAsync(input3);
                     await l.CommitAsync();
 
-                    using (var originalIterator = l.Scan(0, long.MaxValue, readerName))
-                    {
-                        originalIterator.GetNext(out _, out _, out _, out long recoveryAddress);
-                        originalIterator.CompleteUntil(recoveryAddress);
-                        originalIterator.GetNext(out _, out _, out _, out _);  // move the reader ahead
-                        await l.CommitAsync();
-                        originalCompleted = originalIterator.CompletedUntilAddress;
-                    }
+                    using var originalIterator = l.Scan(0, long.MaxValue, readerName);
+                    Assert.IsTrue(originalIterator.GetNext(out _, out _, out _, out long recoveryAddress));
+                    originalIterator.CompleteUntil(recoveryAddress);
+                    Assert.IsTrue(originalIterator.GetNext(out _, out _, out _, out _));  // move the reader ahead
+                    await l.CommitAsync();
+                    originalCompleted = originalIterator.CompletedUntilAddress;
                 }
 
                 using (var l = new FasterLog(new FasterLogSettings { LogDevice = device, PageSizeBits = 16, MemorySizeBits = 16, LogChecksum = logChecksum, LogCommitManager = logCommitManager }))
                 {
-                    using (var recoveredIterator = l.Scan(0, long.MaxValue, readerName))
-                    {
-                        recoveredIterator.GetNext(out byte[] outBuf, out _, out _, out _);
+                    using var recoveredIterator = l.Scan(0, long.MaxValue, readerName);
+                    Assert.IsTrue(recoveredIterator.GetNext(out byte[] outBuf, out _, out _, out _));
 
-                        // we should have read in input2, not input1 or input3
-                        Assert.True(input2.SequenceEqual(outBuf), $"Original: {input2[0]}, Recovered: {outBuf[0]}, Original: {originalCompleted}, Recovered: {recoveredIterator.CompletedUntilAddress}");
+                    // we should have read in input2, not input1 or input3
+                    Assert.True(input2.SequenceEqual(outBuf), $"Original: {input2[0]}, Recovered: {outBuf[0]}, Original: {originalCompleted}, Recovered: {recoveredIterator.CompletedUntilAddress}");
 
-                        // TestContext.Progress.WriteLine($"Original: {originalCompleted}, Recovered: {recoveredIterator.CompletedUntilAddress}"); 
-                    }
+                    // TestContext.Progress.WriteLine($"Original: {originalCompleted}, Recovered: {recoveredIterator.CompletedUntilAddress}"); 
                 }
-            }
-        }
-
-        private static void DeleteDirectory(string path)
-        {
-            foreach (string directory in Directory.GetDirectories(path))
-            {
-                DeleteDirectory(directory);
-            }
-
-            try
-            {
-                Directory.Delete(path, true);
-            }
-            catch (IOException)
-            {
-                try
-                {
-                    Directory.Delete(path, true);
-                }
-                catch { }
-            }
-            catch (UnauthorizedAccessException)
-            {
-                try
-                {
-                    Directory.Delete(path, true);
-                }
-                catch { }
             }
         }
     }

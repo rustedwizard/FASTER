@@ -1,13 +1,12 @@
 ---
-layout: default
-title: FasterKV store + cache in C#
-parent: FASTER C#
-nav_order: 4
-permalink: /cs/fasterkv
+title: "FasterKV Basics"
+permalink: /docs/fasterkv-basics/
+excerpt: "FasterKV Basics"
+last_modified_at: 2020-12-08
+toc: true
 ---
 
-Introduction to FasterKV C#
-===========================
+## Introduction to FasterKV C#
 
 The FasterKV key-value store and cache in C# works in .NET Framework and .NET core, and can be used in both a 
 single-threaded and highly concurrent setting. It has been tested to work on both Windows and Linux. It exposes 
@@ -19,16 +18,6 @@ FASTER  may be used as a high-performance replacement for traditional concurrent
 .NET ConcurrentDictionary, and additionally supports larger-than-memory data. It also supports checkpointing of the 
 data structure - both incremental and non-incremental. Operations on FASTER can be issued synchronously or 
 asynchronously, i.e., using the C# `async` interface.
-
-Table of Contents
------------
-* [Getting FASTER](#getting-faster)
-* [Basic Concepts](#basic-concepts)
-* [Quick End-to-End Sample](#quick-end-to-end-sample)
-* [More Examples](#more-examples)
-* [Handling Variable Length Keys and Values](#handling-variable-length-keys-and-values)
-* [Log Compaction](#log-compaction)
-* [Checkpointing and Recovery](#checkpointing-and-recovery)
 
 ## Getting FASTER
 
@@ -82,46 +71,54 @@ The total in-memory footprint of FASTER is controlled by the following parameter
 words, the size of the log is 2^B bytes, for a parameter setting of B. Note that if the log points to class key or value 
 objects, this size only includes the 8-byte reference to the object. The older part of the log is spilled to storage.
 
-Read more about managing memory in FASTER [here](../tuning).
+Read more about managing memory in FASTER in the [tuning](/FASTER/docs/fasterkv-tuning) guide.
 
 ### Callback Functions
 
-The user provides an instance of a type that implements `IFunctions<Key, Value, Input, Output, Context>`, or its corresponding 
-abstract base class `<Key, Value, Input, Output, Context>`. Apart from Key and Value, functions use three new types:
-1. `Input`: This is the type of input provided to FASTER when calling Read or RMW. It may be regarded as a parameter for the 
-Read or RMW operation. For example, with RMW, it may be the delta being accumulated into the value.
+#### IFunctions
+
+For session operations, the user provides an instance of a type that implements `IFunctions<Key, Value, Input, Output, Context>`, or one of its corresponding abstract base classes (see [FunctionsBase.cs](https://github.com/microsoft/FASTER/blob/master/cs/src/core/Index/Interfaces/FunctionsBase.cs)):
+- `FunctionsBase<Key, Value, Input, Output, Context>`
+- `SimpleFunctions<Key, Value, Context>`, a subclass of `FunctionsBase<Key, Value, Input, Output, Context>` that uses Value for the Input and Output types.
+- `SimpleFunctions<Key, Value>`, a subclass of `SimpleFunctions<Key, Value, Context>` that uses the `Empty` struct for Context.
+
+Apart from Key and Value, the IFunctions interface is defined on three additional types:
+1. `Input`: This is the type of input provided to FASTER when calling Read or RMW. It may be regarded as a parameter for the Read or RMW operation. For example, with RMW, it may be the delta being accumulated into the value.
 2. `Output`: This is the type of the output of a Read operation. The reader copies the relevant parts of the Value to Output.
 3. `Context`: User-defined context for the operation. Use `Empty` if there is no context necesssary.
 
+`IFunctions<>` encapsulates all callbacks made by FASTER back to the caller, which are described next:
 
-`IFunctions<>` encapsulates all callbacks made by FASTER back to the caller, and are described next:
+1. SingleReader and ConcurrentReader: These are used to read from the store values and copy them to Output. Single reader can assume that there are no concurrent operations on the record.
+2. SingleWriter and ConcurrentWriter: These are used to write values to the store, from a source value. Concurrent writer can assume that there are no concurrent operations on the record.
+3. Completion callbacks: Called by FASTER when various operations complete after they have gone "pending" due to requiring IO.
+4. RMW Updaters: There are three updaters that the user specifies, InitialUpdater, InPlaceUpdater, and CopyUpdater. Together, they are used to implement the RMW operation.
 
-1. SingleReader and ConcurrentReader: These are used to read from the store values and copy them to Output. Single reader can 
-assume that there are no concurrent operations on the record.
-2. SingleWriter and ConcurrentWriter: These are used to write values to the store, from a source value. Concurrent writer can 
-assume that there are no concurrent operations on the record.
-3. Completion callbacks: Called by FASTER when various operations complete.
-4. RMW Updaters: There are three updaters that the user specifies, InitialUpdater, InPlaceUpdater, and CopyUpdater. Together, 
-they are used to implement the RMW operation.
+#### IAdvancedFunctions
 
+`IAdvancedFunctions` is a superset of `IFunctions` and provides the same methods with some additional parameters:
+- ReadCompletionCallback receives the `RecordInfo` of the record that was read.
+- Other callbacks receive the logical address of the record, which can be useful for applications such as indexing.
+
+`IAdvancedFunctions` is a separate interface; it does not inherit from `IFunctions`.
+
+As with `IFunctions`, [FunctionsBase.cs](https://github.com/microsoft/FASTER/blob/master/cs/src/core/Index/Interfaces/FunctionsBase.cs) defines abstract base classes to provide a default implementation of `IAdvancedFunctions`, using the same names prefixed with `Advanced`.
 
 ### Sessions
 
-Once FASTER is instantiated, one issues operations to FASTER by creating logical sessions. A session represents a "mono-threaded" sequence 
-of operations issued to FASTER. There is no concurrency within a session, but different sessions may execute concurrently. Sessions do not
-need to be affinitized to threads, but if they are, FASTER can leverage the same (covered later). You create a session as follows:
+Once FASTER is instantiated, one issues operations to FASTER by creating logical sessions. A session represents a "mono-threaded" sequence of operations issued to FASTER. There is no concurrency within a session, but different sessions may execute concurrently. Sessions do not need to be affinitized to threads, but if they are, FASTER can leverage the same (covered later). You create a session as follows:
 
 ```var session = store.NewSession(new Functions());```
 
-An equivalent, but more optimized API requires you to specify the Functions type a second time (it allows us to avoid accessing the 
-session via an interface call):
+An equivalent, but more optimized API requires you to specify the Functions type a second time (it allows us to avoid accessing the session via an interface call):
 
 ```cs
 var session = store.For(new Functions()).NewSession<Functions>();
 ```
 
-You can then perform a sequence of read, upsert, and RMW operations on the session. FASTER supports sync and async versions of 
-operations. The operations are described below.
+As with the `IFunctions` and `IAdvancedFunctions` interfaces, there are separate, non-inheriting session classes that provide identical methods: `ClientSession` is returned by `NewSession` for a `Functions` class that implements `IFunctions`, and `AdvancedClientSession` is returned by `NewSession` for a `Functions` class that implements `IAdvancedFunctions`.
+
+You can then perform a sequence of read, upsert, and RMW operations on the session. FASTER supports synchronous versions of all operations, as well as async versions of read and RMW (upserts do not go async by default). The basic forms of these operations are described below; additional overloads are available.
 
 #### Read
 
@@ -136,7 +133,6 @@ await session.ReadAsync(key, input);
 ```cs
 var status = session.Upsert(ref key, ref value);
 var status = session.Upsert(ref key, ref value, ref context, ref serialNo);
-await session.UpsertAsync(key, value);
 ```
 
 #### RMW
@@ -232,21 +228,31 @@ FASTER also support true "log compaction", where the log is scanned and live rec
   compactUntil = session.Compact(compactUntil, shiftBeginAddress: true);
 ```
 
-This call perform synchronous compaction on the provided session until the specific `compactUntil` address, scanning and copying the live records to the tail. It returns the actual log address that the call compacted until (next nearest record boundary). Typically, you may compact 10-20% of the log, e.g., you set `compactUntil` address to `store.Log.BeginAddress + (store.Log.TailAddress - store.Log.BeginAddress) / 5`. The parameter `shiftBeginAddress`, when true, causes the compation to also shift the begin address when the compaction is complete. However, since live records are written to the tail, this operation may result in data loss if the store fails immediately. If you do not want to lose data, you need to trigger compaction with `shiftBeginAddress` set to false, then complete a checkpoint (either fold-over or snaphot is fine), and then shift the begin address, as shown below:
+This call perform synchronous compaction on the provided session until the specific `compactUntil` address, scanning and copying the live records to the tail. It returns the actual log address that the call compacted until (next nearest record boundary). You can only compact until the log's `SafeReadOnlyAddress` as the rest of the log is still mutable in-place. If you wish, you can move the read-only address to the tail by calling `store.Log.ShiftReadOnlyToTail(store.Log.TailAddress, true)` or by simply taking a fold-over checkpoint (`await store.TakeHybridLogCheckpointAsync(CheckpointType.FoldOver)`).
+
+Typically, you may compact around 20% (up to 100%) of the log, e.g., you could set `compactUntil` address to `store.Log.BeginAddress + 0.2 * (store.Log.SafeReadOnlyAddress - store.Log.BeginAddress)`. The parameter `shiftBeginAddress`, when true, causes log compation to also automatically shift the log's begin address when the compaction is complete. However, since live records are written to the tail, directly shifting the begin address may result in data loss if the store fails immediately after the call. If you do not want to lose data, you need to trigger compaction with `shiftBeginAddress` set to false, then complete a checkpoint (either fold-over or snaphot is fine), and then shift the begin address. Finally, you can take another checkpoint to save the new begin address. This is shown below:
 
 ```cs
-  long compactUntil = store.Log.BeginAddress + (store.Log.TailAddress - store.Log.BeginAddress) / 5;
+  long compactUntil = store.Log.BeginAddress + 0.2 * (store.Log.SafeReadOnlyAddress - store.Log.BeginAddress);
   compactUntil = session.Compact(compactUntil, shiftBeginAddress: false);
   await store.TakeHybridLogCheckpointAsync(CheckpointType.FoldOver);
   store.Log.ShiftBeginAddress(compactUntil);
+  await store.TakeHybridLogCheckpointAsync(CheckpointType.FoldOver);
 ```
 
 
 ## Checkpointing and Recovery
 
-FASTER supports **checkpoint-based recovery**. Every new checkpoint persists (or makes durable) additional user-operations
+FASTER supports asynchronous non-blocking **checkpoint-based recovery**. Every new checkpoint persists (or makes durable) additional user-operations
 (Read, Upsert or RMW). FASTER allows clients to keep track of operations that have persisted and those that have not using 
-a session-based API. 
+a session-based API.
+
+This feature is based on a recovery model called Concurrent Prefix Recovery (CPR for short). You can read more about 
+CPR in the research paper [here](https://www.microsoft.com/en-us/research/uploads/prod/2019/01/cpr-sigmod19.pdf).
+Briefly, CPR is based on (periodic) group commit. However, instead of using an expensive 
+write-ahead log (WAL) which can kill FASTER's high performance, CPR: (1) provides a semantic description of committed
+operations, of the form “all operations until offset Ti in session i”; and (2) uses asynchronous 
+incremental checkpointing instead of a WAL to implement group commit in a scalable bottleneck-free manner.
 
 Recall that each FASTER client starts a session, associated with a unique session ID (or name). All FASTER session operations
 (Read, Upsert, RMW) carry a monotonic sequence number (sequence numbers are implicit in case of async calls). At any point in 
@@ -267,7 +273,7 @@ an asynchronous commit (checkpoint). The user is responsible for initiating the 
 
 Below, we show a simple recovery example with asynchronous checkpointing.
 
-```Csharp
+```cs
 public class PersistenceExample
 {
     private FasterKV<long, long> fht;
@@ -342,3 +348,4 @@ incremental nature. You can find a few basic checkpointing examples
 [here](https://github.com/Microsoft/FASTER/blob/master/cs/test/SimpleRecoveryTest.cs) and 
 [here](https://github.com/Microsoft/FASTER/tree/master/cs/playground/SumStore). We plan to add more examples and details going
 forward.
+
