@@ -34,7 +34,7 @@ namespace FASTER.core
         private readonly IFasterEqualityComparer<Key> comparer;
 
         internal readonly bool UseReadCache;
-        private readonly bool CopyReadsToTail;
+        private readonly CopyReadsToTail CopyReadsToTail;
         private readonly bool FoldOverSnapshot;
         internal readonly int sectorSize;
         private readonly bool WriteDefaultOnDelete;
@@ -59,6 +59,11 @@ namespace FASTER.core
         public long IndexSize => state[resizeInfo.version].size;
 
         /// <summary>
+        /// Number of overflow buckets in use (64 bytes each)
+        /// </summary>
+        public long OverflowBucketCount => overflowBucketsAllocator.GetMaxValidAddress();
+
+        /// <summary>
         /// Comparer used by FASTER
         /// </summary>
         public IFasterEqualityComparer<Key> Comparer => comparer;
@@ -72,11 +77,6 @@ namespace FASTER.core
         /// Read cache used by this FASTER instance
         /// </summary>
         public LogAccessor<Key, Value> ReadCache { get; }
-
-        /// <summary>
-        /// An accessor to the record at a given logical address, for use in IFunctions callbacks.
-        /// </summary>
-        public RecordAccessor<Key, Value> RecordAccessor { get; }
 
         internal ConcurrentDictionary<string, CommitPoint> _recoveredSessions;
 
@@ -115,8 +115,6 @@ namespace FASTER.core
                 }
             }
 
-            this.RecordAccessor = new RecordAccessor<Key, Value>(this);
-
             if (checkpointSettings == null)
                 checkpointSettings = new CheckpointSettings();
 
@@ -137,7 +135,7 @@ namespace FASTER.core
                     new DeviceLogCommitCheckpointManager
                     (new LocalStorageNamedDeviceFactory(),
                         new DefaultCheckpointNamingScheme(
-                          new DirectoryInfo(checkpointSettings.CheckpointDir ?? ".").FullName));
+                          new DirectoryInfo(checkpointSettings.CheckpointDir ?? ".").FullName), removeOutdated: checkpointSettings.RemoveOutdated);
             }
 
             if (checkpointSettings.CheckpointManager == null)
@@ -148,7 +146,7 @@ namespace FASTER.core
 
             if (logSettings.ReadCacheSettings != null)
             {
-                CopyReadsToTail = false;
+                CopyReadsToTail = CopyReadsToTail.None;
                 UseReadCache = true;
             }
 
@@ -236,18 +234,8 @@ namespace FASTER.core
         /// fail if we are already taking a checkpoint or performing some other
         /// operation such as growing the index). Use CompleteCheckpointAsync to wait completion.
         /// </returns>
-        public bool TakeFullCheckpoint(out Guid token)
-        {
-            ISynchronizationTask backend;
-            if (FoldOverSnapshot)
-                backend = new FoldOverCheckpointTask();
-            else
-                backend = new SnapshotCheckpointTask();
-
-            var result = StartStateMachine(new FullCheckpointStateMachine(backend, -1));
-            token = _hybridLogCheckpointToken;
-            return result;
-        }
+        public bool TakeFullCheckpoint(out Guid token) 
+            => TakeFullCheckpoint(out token, this.FoldOverSnapshot ? CheckpointType.FoldOver : CheckpointType.Snapshot);
 
         /// <summary>
         /// Initiate full checkpoint
@@ -295,7 +283,7 @@ namespace FASTER.core
             var success = TakeFullCheckpoint(out Guid token, checkpointType);
 
             if (success)
-                await CompleteCheckpointAsync(cancellationToken);
+                await CompleteCheckpointAsync(cancellationToken).ConfigureAwait(false);
 
             return (success, token);
         }
@@ -329,7 +317,7 @@ namespace FASTER.core
             var success = TakeIndexCheckpoint(out Guid token);
 
             if (success)
-                await CompleteCheckpointAsync(cancellationToken);
+                await CompleteCheckpointAsync(cancellationToken).ConfigureAwait(false);
 
             return (success, token);
         }
@@ -357,14 +345,20 @@ namespace FASTER.core
         /// </summary>
         /// <param name="token">Checkpoint token</param>
         /// <param name="checkpointType">Checkpoint type</param>
+        /// <param name="tryIncremental">For snapshot, try to store as incremental delta over last snapshot</param>
         /// <returns>Whether we could initiate the checkpoint. Use CompleteCheckpointAsync to wait completion.</returns>
-        public bool TakeHybridLogCheckpoint(out Guid token, CheckpointType checkpointType)
+        public bool TakeHybridLogCheckpoint(out Guid token, CheckpointType checkpointType, bool tryIncremental = false)
         {
             ISynchronizationTask backend;
             if (checkpointType == CheckpointType.FoldOver)
                 backend = new FoldOverCheckpointTask();
             else if (checkpointType == CheckpointType.Snapshot)
-                backend = new SnapshotCheckpointTask();
+            {
+                if (tryIncremental && _lastSnapshotCheckpoint.info.guid != default && _lastSnapshotCheckpoint.info.finalLogicalAddress > hlog.FlushedUntilAddress)
+                    backend = new IncrementalSnapshotCheckpointTask();
+                else
+                    backend = new SnapshotCheckpointTask();
+            }
             else
                 throw new FasterException("Unsupported checkpoint type");
 
@@ -377,6 +371,7 @@ namespace FASTER.core
         /// Take log-only checkpoint
         /// </summary>
         /// <param name="checkpointType">Checkpoint type</param>
+        /// <param name="tryIncremental">For snapshot, try to store as incremental delta over last snapshot</param>
         /// <param name="cancellationToken">Cancellation token</param>
         /// <returns>
         /// (bool success, Guid token)
@@ -386,44 +381,44 @@ namespace FASTER.core
         /// token: Token for taken checkpoint
         /// Await task to complete checkpoint, if initiated successfully
         /// </returns>
-        public async ValueTask<(bool success, Guid token)> TakeHybridLogCheckpointAsync(CheckpointType checkpointType, CancellationToken cancellationToken = default)
+        public async ValueTask<(bool success, Guid token)> TakeHybridLogCheckpointAsync(CheckpointType checkpointType, bool tryIncremental = false, CancellationToken cancellationToken = default)
         {
-            var success = TakeHybridLogCheckpoint(out Guid token, checkpointType);
+            var success = TakeHybridLogCheckpoint(out Guid token, checkpointType, tryIncremental);
 
             if (success)
-                await CompleteCheckpointAsync(cancellationToken);
+                await CompleteCheckpointAsync(cancellationToken).ConfigureAwait(false);
 
             return (success, token);
         }
 
         /// <summary>
-        /// Recover from the latest checkpoint (blocking operation)
+        /// Recover from the latest valid checkpoint (blocking operation)
         /// </summary>
         /// <param name="numPagesToPreload">Number of pages to preload into memory (beyond what needs to be read for recovery)</param>
-        /// <param name="undoFutureVersions">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
-        public void Recover(int numPagesToPreload = -1, bool undoFutureVersions = true)
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        public void Recover(int numPagesToPreload = -1, bool undoNextVersion = true)
         {
-            InternalRecoverFromLatestCheckpoints(numPagesToPreload, undoFutureVersions);
+            InternalRecoverFromLatestCheckpoints(numPagesToPreload, undoNextVersion);
         }
 
         /// <summary>
-        /// Asynchronously recover from the latest checkpoint (blocking operation)
+        /// Asynchronously recover from the latest valid checkpoint (blocking operation)
         /// </summary>
         /// <param name="numPagesToPreload">Number of pages to preload into memory (beyond what needs to be read for recovery)</param>
-        /// <param name="undoFutureVersions">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
         /// <param name="cancellationToken">Cancellation token</param>
-        public ValueTask RecoverAsync(int numPagesToPreload = -1, bool undoFutureVersions = true, CancellationToken cancellationToken = default)
-            => InternalRecoverFromLatestCheckpointsAsync(numPagesToPreload, undoFutureVersions, cancellationToken);
+        public ValueTask RecoverAsync(int numPagesToPreload = -1, bool undoNextVersion = true, CancellationToken cancellationToken = default)
+            => InternalRecoverFromLatestCheckpointsAsync(numPagesToPreload, undoNextVersion, cancellationToken);
 
         /// <summary>
         /// Recover from specific token (blocking operation)
         /// </summary>
         /// <param name="fullCheckpointToken">Token</param>
         /// <param name="numPagesToPreload">Number of pages to preload into memory after recovery</param>
-        /// <param name="undoFutureVersions">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
-        public void Recover(Guid fullCheckpointToken, int numPagesToPreload = -1, bool undoFutureVersions = true)
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        public void Recover(Guid fullCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true)
         {
-            InternalRecover(fullCheckpointToken, fullCheckpointToken, numPagesToPreload, undoFutureVersions);
+            InternalRecover(fullCheckpointToken, fullCheckpointToken, numPagesToPreload, undoNextVersion);
         }
 
         /// <summary>
@@ -431,10 +426,10 @@ namespace FASTER.core
         /// </summary>
         /// <param name="fullCheckpointToken">Token</param>
         /// <param name="numPagesToPreload">Number of pages to preload into memory after recovery</param>
-        /// <param name="undoFutureVersions">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
         /// <param name="cancellationToken">Cancellation token</param>
-        public ValueTask RecoverAsync(Guid fullCheckpointToken, int numPagesToPreload = -1, bool undoFutureVersions = true, CancellationToken cancellationToken = default) 
-            => InternalRecoverAsync(fullCheckpointToken, fullCheckpointToken, numPagesToPreload, undoFutureVersions, cancellationToken);
+        public ValueTask RecoverAsync(Guid fullCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true, CancellationToken cancellationToken = default) 
+            => InternalRecoverAsync(fullCheckpointToken, fullCheckpointToken, numPagesToPreload, undoNextVersion, cancellationToken);
 
         /// <summary>
         /// Recover from specific index and log token (blocking operation)
@@ -442,10 +437,10 @@ namespace FASTER.core
         /// <param name="indexCheckpointToken"></param>
         /// <param name="hybridLogCheckpointToken"></param>
         /// <param name="numPagesToPreload">Number of pages to preload into memory after recovery</param>
-        /// <param name="undoFutureVersions">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
-        public void Recover(Guid indexCheckpointToken, Guid hybridLogCheckpointToken, int numPagesToPreload = -1, bool undoFutureVersions = true)
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        public void Recover(Guid indexCheckpointToken, Guid hybridLogCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true)
         {
-            InternalRecover(indexCheckpointToken, hybridLogCheckpointToken, numPagesToPreload, undoFutureVersions);
+            InternalRecover(indexCheckpointToken, hybridLogCheckpointToken, numPagesToPreload, undoNextVersion);
         }
 
         /// <summary>
@@ -454,10 +449,10 @@ namespace FASTER.core
         /// <param name="indexCheckpointToken"></param>
         /// <param name="hybridLogCheckpointToken"></param>
         /// <param name="numPagesToPreload">Number of pages to preload into memory after recovery</param>
-        /// <param name="undoFutureVersions">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
+        /// <param name="undoNextVersion">Whether records with versions beyond checkpoint version need to be undone (and invalidated on log)</param>
         /// <param name="cancellationToken">Cancellation token</param>
-        public ValueTask RecoverAsync(Guid indexCheckpointToken, Guid hybridLogCheckpointToken, int numPagesToPreload = -1, bool undoFutureVersions = true, CancellationToken cancellationToken = default) 
-            => InternalRecoverAsync(indexCheckpointToken, hybridLogCheckpointToken, numPagesToPreload, undoFutureVersions, cancellationToken);
+        public ValueTask RecoverAsync(Guid indexCheckpointToken, Guid hybridLogCheckpointToken, int numPagesToPreload = -1, bool undoNextVersion = true, CancellationToken cancellationToken = default) 
+            => InternalRecoverAsync(indexCheckpointToken, hybridLogCheckpointToken, numPagesToPreload, undoNextVersion, cancellationToken);
 
         /// <summary>
         /// Wait for ongoing checkpoint to complete
@@ -477,7 +472,7 @@ namespace FASTER.core
                     systemState.phase == Phase.IN_PROGRESS_GROW)
                     return;
 
-                List<ValueTask> valueTasks = new List<ValueTask>();
+                List<ValueTask> valueTasks = new();
                 
                 ThreadStateMachineStep<Empty, Empty, Empty, NullFasterSession>(null, NullFasterSession.Instance, valueTasks, token);
 
@@ -487,7 +482,7 @@ namespace FASTER.core
                 foreach (var task in valueTasks)
                 {
                     if (!task.IsCompleted)
-                        await task;
+                        await task.ConfigureAwait(false);
                 }
             }
         }
@@ -598,7 +593,7 @@ namespace FASTER.core
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        internal Status ContextRMW<Input, Output, Context, FasterSession>(ref Key key, ref Input input, Context context, FasterSession fasterSession, long serialNo,
+        internal Status ContextRMW<Input, Output, Context, FasterSession>(ref Key key, ref Input input, ref Output output, Context context, FasterSession fasterSession, long serialNo,
             FasterExecutionContext<Input, Output, Context> sessionCtx)
             where FasterSession : IFasterSession<Key, Value, Input, Output, Context>
         {
@@ -606,7 +601,7 @@ namespace FASTER.core
             OperationStatus internalStatus;
 
             do
-                internalStatus = InternalRMW(ref key, ref input, ref context, ref pcontext, fasterSession, sessionCtx, serialNo);
+                internalStatus = InternalRMW(ref key, ref input, ref output, ref context, ref pcontext, fasterSession, sessionCtx, serialNo);
             while (internalStatus == OperationStatus.RETRY_NOW);
 
             Status status;
@@ -656,12 +651,43 @@ namespace FASTER.core
         }
 
         /// <summary>
-        /// Grow the hash index
+        /// Grow the hash index by a factor of two. Make sure to take a full checkpoint
+        /// after growth, for persistence.
         /// </summary>
-        /// <returns>Whether the request succeeded</returns>
+        /// <returns>Whether the grow completed</returns>
         public bool GrowIndex()
         {
-            return StartStateMachine(new IndexResizeStateMachine());
+            if (LightEpoch.AnyInstanceProtected())
+                throw new FasterException("Cannot use GrowIndex when using legacy or non-async sessions");
+
+            if (!StartStateMachine(new IndexResizeStateMachine())) return false;
+
+            epoch.Resume();
+
+            try
+            {
+                while (true)
+                {
+                    SystemState _systemState = SystemState.Copy(ref systemState);
+                    if (_systemState.phase == Phase.IN_PROGRESS_GROW)
+                    {
+                        SplitBuckets(0);
+                        epoch.ProtectAndDrain();
+                    }
+                    else
+                    {
+                        SystemState.RemoveIntermediate(ref _systemState);
+                        if (_systemState.phase != Phase.PREPARE_GROW && _systemState.phase != Phase.IN_PROGRESS_GROW)
+                        {
+                            return true;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                epoch.Suspend();
+            }
         }
 
         /// <summary>
@@ -672,6 +698,8 @@ namespace FASTER.core
             Free();
             hlog.Dispose();
             readcache?.Dispose();
+            _lastSnapshotCheckpoint.deltaLog?.Dispose();
+            _lastSnapshotCheckpoint.deltaFileDevice?.Dispose();
             if (disposeCheckpointManager)
                 checkpointManager?.Dispose();
         }
@@ -778,21 +806,21 @@ namespace FASTER.core
             var ptable_ = state[version].tableAligned;
             long total_record_count = 0;
             long beginAddress = hlog.BeginAddress;
-            Dictionary<int, long> histogram = new Dictionary<int, long>();
+            Dictionary<int, long> histogram = new();
 
             for (long bucket = 0; bucket < table_size_; ++bucket)
             {
-                List<int> tags = new List<int>();
+                List<int> tags = new();
                 int cnt = 0;
                 HashBucket b = *(ptable_ + bucket);
                 while (true)
                 {
                     for (int bucket_entry = 0; bucket_entry < Constants.kOverflowBucketIndex; ++bucket_entry)
                     {
-                        if (b.bucket_entries[bucket_entry] >= beginAddress)
+                        var x = default(HashBucketEntry);
+                        x.word = b.bucket_entries[bucket_entry];
+                        if (((!x.ReadCache) && (x.Address >= beginAddress)) || (x.ReadCache && ((x.Address & ~Constants.kReadCacheBitMask) >= readcache.HeadAddress)))
                         {
-                            var x = default(HashBucketEntry);
-                            x.word = b.bucket_entries[bucket_entry];
                             if (tags.Contains(x.Tag) && !x.Tentative)
                                 throw new FasterException("Duplicate tag found in index");
                             tags.Add(x.Tag);
@@ -809,7 +837,9 @@ namespace FASTER.core
             }
 
             var distribution =
-                $"Number of hash buckets: {{{table_size_}}}\n" +
+                $"Number of hash buckets: {table_size_}\n" +
+                $"Number of overflow buckets: {OverflowBucketCount}\n" +
+                $"Size of each bucket: {Constants.kEntriesPerBucket * sizeof(HashBucketEntry)} bytes\n" +
                 $"Total distinct hash-table entry count: {{{total_record_count}}}\n" +
                 $"Average #entries per hash bucket: {{{total_record_count / (double)table_size_:0.00}}}\n" +
                 $"Histogram of #entries per bucket:\n";

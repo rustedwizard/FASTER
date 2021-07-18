@@ -22,7 +22,7 @@ namespace FASTER.core
             BeginMainIndexCheckpoint(ht_version, _indexCheckpoint.main_ht_device, out ulong ht_num_bytes_written, UseReadCache, SkipReadCacheBucket);
 
             var sectorSize = _indexCheckpoint.main_ht_device.SectorSize;
-            var alignedIndexSize = (uint)((ht_num_bytes_written + (sectorSize - 1)) & ~(sectorSize - 1));
+            var alignedIndexSize = (ht_num_bytes_written + (sectorSize - 1)) & ~((ulong)sectorSize - 1);
             overflowBucketsAllocator.BeginCheckpoint(_indexCheckpoint.main_ht_device, alignedIndexSize, out ulong ofb_num_bytes_written, UseReadCache, SkipReadCacheBucket, epoch);
             _indexCheckpoint.info.num_ht_bytes = ht_num_bytes_written;
             _indexCheckpoint.info.num_ofb_bytes = ofb_num_bytes_written;
@@ -37,7 +37,7 @@ namespace FASTER.core
         {
             BeginMainIndexCheckpoint(ht_version, device, out numBytesWritten);
             var sectorSize = device.SectorSize;
-            var alignedIndexSize = (uint)((numBytesWritten + (sectorSize - 1)) & ~(sectorSize - 1));
+            var alignedIndexSize = (numBytesWritten + (sectorSize - 1)) & ~((ulong)sectorSize - 1);
             overflowBucketsAllocator.BeginCheckpoint(ofbdevice, alignedIndexSize, out ofbnumBytesWritten);
             num_ofb_buckets = overflowBucketsAllocator.GetMaxValidAddress();
         }
@@ -54,8 +54,8 @@ namespace FASTER.core
             // Get tasks first to ensure we have captured the semaphore instances synchronously
             var t1 = IsMainIndexCheckpointCompletedAsync(token);
             var t2 = overflowBucketsAllocator.IsCheckpointCompletedAsync(token);
-            await t1;
-            await t2;
+            await t1.ConfigureAwait(false);
+            await t2.ConfigureAwait(false);
         }
 
 
@@ -126,7 +126,7 @@ namespace FASTER.core
         private async ValueTask IsMainIndexCheckpointCompletedAsync(CancellationToken token = default)
         {
             var s = mainIndexCheckpointSemaphore;
-            await s.WaitAsync(token);
+            await s.WaitAsync(token).ConfigureAwait(false);
             s.Release();
         }
 

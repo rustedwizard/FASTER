@@ -22,6 +22,7 @@ namespace FASTER.test.recovery
         string path;
         string deviceName;
         CancellationTokenSource cts;
+        SemaphoreSlim done;
 
         [SetUp]
         public void Setup()
@@ -29,18 +30,20 @@ namespace FASTER.test.recovery
             path = Path.GetTempPath() + "RecoverReadOnlyTest/";
             deviceName = path + "testlog";
             if (Directory.Exists(path))
-                Directory.Delete(path, true);
+                TestUtils.DeleteDirectory(path);
             cts = new CancellationTokenSource();
+            done = new SemaphoreSlim(0);
         }
 
         [TearDown]
         public void TearDown()
         {
-            Directory.Delete(path, true);
+            TestUtils.DeleteDirectory(path);
             cts.Dispose();
         }
 
         [Test]
+        [Category("FasterLog")]
         public async Task RecoverReadOnlyCheck1([Values] bool isAsync)
         {
             using var device = Devices.CreateLogDevice(deviceName);
@@ -60,7 +63,8 @@ namespace FASTER.test.recovery
                 log.RefreshUncommitted();
                 await Task.Delay(TimeSpan.FromMilliseconds(ProducerPauseMs));
             }
-            await Task.Delay(TimeSpan.FromMilliseconds(CommitPeriodMs * 4));
+            // Ensure the reader had time to see all data
+            await done.WaitAsync();
             cts.Cancel();
         }
 
@@ -71,7 +75,7 @@ namespace FASTER.test.recovery
                 while (!cancellationToken.IsCancellationRequested)
                 {
                     await Task.Delay(TimeSpan.FromMilliseconds(CommitPeriodMs), cancellationToken);
-                    await log.CommitAsync();
+                    await log.CommitAsync(cancellationToken);
                 }
             } catch (OperationCanceledException) { }
         }
@@ -98,6 +102,8 @@ namespace FASTER.test.recovery
                     Assert.AreEqual(prevValue + 1, value);
                     prevValue = value;
                     iter.CompleteUntil(nextAddress);
+                    if (prevValue == NumElements - 1)
+                        done.Release();
                 }
             } catch (OperationCanceledException) { }
             Assert.AreEqual(NumElements - 1, prevValue);

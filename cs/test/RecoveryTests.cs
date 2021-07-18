@@ -49,10 +49,11 @@ namespace FASTER.test.recovery.sumstore
             fht.Dispose();
             fht = null;
             log.Dispose();
-            Directory.Delete(test_path, true);
+            TestUtils.DeleteDirectory(test_path);
         }
 
         [Test]
+        [Category("FasterKV")]
         public async ValueTask RecoveryTestSeparateCheckpoint([Values]bool isAsync)
         {
             Populate(SeparateCheckpointAction);
@@ -69,6 +70,7 @@ namespace FASTER.test.recovery.sumstore
         }
 
         [Test]
+        [Category("FasterKV")]
         public async ValueTask RecoveryTestFullCheckpoint([Values] bool isAsync)
         {
             Populate(FullCheckpointAction);

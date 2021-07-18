@@ -26,9 +26,13 @@ namespace FASTER.core
         internal readonly IVariableLengthStruct<Key> KeyLength;
         internal readonly IVariableLengthStruct<Value> ValueLength;
 
+        private readonly OverflowPool<PageUnit> overflowPagePool;
+
         public VariableLengthBlittableAllocator(LogSettings settings, VariableLengthStructSettings<Key, Value> vlSettings, IFasterEqualityComparer<Key> comparer, Action<long, long> evictCallback = null, LightEpoch epoch = null, Action<CommitInfo> flushCallback = null)
             : base(settings, comparer, evictCallback, epoch, flushCallback)
         {
+            overflowPagePool = new OverflowPool<PageUnit>(4, p => p.handle.Free());
+
             values = new byte[BufferSize][];
             handles = new GCHandle[BufferSize];
             pointers = new long[BufferSize];
@@ -51,6 +55,8 @@ namespace FASTER.core
                 ValueLength = new FixedLengthStruct<Value>();
             }
         }
+
+        internal override int OverflowPageCount => overflowPagePool.Count;
 
         public override void Initialize()
         {
@@ -158,6 +164,13 @@ namespace FASTER.core
                 ((ValueLength.GetInitialLength() + kRecordAlignment - 1) & (~(kRecordAlignment - 1)));
         }
 
+        public override int GetFixedRecordSize()
+        {
+            return RecordInfo.GetLength()
+                + (fixedSizeKey ? KeyLength.GetInitialLength() : 0)
+                + (fixedSizeValue ? ValueLength.GetInitialLength() : 0);
+        }
+
         public override (int, int) GetInitialRecordSize<TInput, FasterSession>(ref Key key, ref TInput input, FasterSession fasterSession)
         {
             var actualSize = RecordInfo.GetLength() +
@@ -191,6 +204,8 @@ namespace FASTER.core
         /// </summary>
         public override void Dispose()
         {
+            base.Dispose();
+
             if (values != null)
             {
                 for (int i = 0; i < values.Length; i++)
@@ -203,7 +218,7 @@ namespace FASTER.core
             handles = null;
             pointers = null;
             values = null;
-            base.Dispose();
+            overflowPagePool.Dispose();
         }
 
         public override AddressInfo* GetKeyAddressInfo(long physicalAddress)
@@ -222,13 +237,23 @@ namespace FASTER.core
         /// <param name="index"></param>
         internal override void AllocatePage(int index)
         {
+            Interlocked.Increment(ref AllocatedPageCount);
+
+            if (overflowPagePool.TryGet(out var item))
+            {
+                handles[index] = item.handle;
+                pointers[index] = item.pointer;
+                values[index] = item.value;
+                return;
+            }
+
             var adjustedSize = PageSize + 2 * sectorSize;
             byte[] tmp = new byte[adjustedSize];
             Array.Clear(tmp, 0, adjustedSize);
 
             handles[index] = GCHandle.Alloc(tmp, GCHandleType.Pinned);
             long p = (long)handles[index].AddrOfPinnedObject();
-            pointers[index] = (p + (sectorSize - 1)) & ~(sectorSize - 1);
+            pointers[index] = (p + (sectorSize - 1)) & ~((long)sectorSize - 1);
             values[index] = tmp;
         }
 
@@ -243,7 +268,7 @@ namespace FASTER.core
             return *(nativePointers + pageIndex) + offset;
         }
 
-        protected override bool IsAllocated(int pageIndex)
+        internal override bool IsAllocated(int pageIndex)
         {
             return values[pageIndex] != null;
         }
@@ -293,7 +318,7 @@ namespace FASTER.core
             return page << LogPageSizeBits;
         }
 
-        protected override void ClearPage(long page, int offset)
+        internal override void ClearPage(long page, int offset)
         {
             if (offset == 0)
                 Array.Clear(values[page % BufferSize], offset, values[page % BufferSize].Length - offset);
@@ -302,6 +327,25 @@ namespace FASTER.core
                 // Adjust array offset for cache alignment
                 offset += (int)(pointers[page % BufferSize] - (long)handles[page % BufferSize].AddrOfPinnedObject());
                 Array.Clear(values[page % BufferSize], offset, values[page % BufferSize].Length - offset);
+            }
+        }
+
+        internal override void FreePage(long page)
+        {
+            ClearPage(page, 0);
+            if (EmptyPageCount > 0)
+            {
+                int index = (int)(page % BufferSize);
+                overflowPagePool.TryAdd(new PageUnit
+                {
+                    handle = handles[index],
+                    pointer = pointers[index],
+                    value = values[index]
+                });
+                values[index] = null;
+                pointers[index] = 0;
+                handles[index] = default;
+                Interlocked.Decrement(ref AllocatedPageCount);
             }
         }
 
@@ -319,29 +363,6 @@ namespace FASTER.core
             handles = null;
             pointers = null;
             values = null;
-        }
-
-
-        private void WriteAsync<TContext>(IntPtr alignedSourceAddress, ulong alignedDestinationAddress, uint numBytesToWrite,
-                        DeviceIOCompletionCallback callback, PageAsyncFlushResult<TContext> asyncResult,
-                        IDevice device)
-        {
-            if (asyncResult.partial)
-            {
-                // Write only required bytes within the page
-                int aligned_start = (int)((asyncResult.fromAddress - (asyncResult.page << LogPageSizeBits)));
-                aligned_start = (aligned_start / sectorSize) * sectorSize;
-
-                int aligned_end = (int)((asyncResult.untilAddress - (asyncResult.page << LogPageSizeBits)));
-                aligned_end = ((aligned_end + (sectorSize - 1)) & ~(sectorSize - 1));
-
-                numBytesToWrite = (uint)(aligned_end - aligned_start);
-                device.WriteAsync(alignedSourceAddress + aligned_start, alignedDestinationAddress + (ulong)aligned_start, numBytesToWrite, callback, asyncResult);
-            }
-            else
-            {
-                device.WriteAsync(alignedSourceAddress, alignedDestinationAddress, numBytesToWrite, callback, asyncResult);
-            }
         }
 
         protected override void ReadAsync<TContext>(
@@ -438,6 +459,13 @@ namespace FASTER.core
         public override IFasterScanIterator<Key, Value> Scan(long beginAddress, long endAddress, ScanBufferingMode scanBufferingMode)
         {
             return new VariableLengthBlittableScanIterator<Key, Value>(this, beginAddress, endAddress, scanBufferingMode, epoch);
+        }
+
+        /// <inheritdoc />
+        internal override void MemoryPageScan(long beginAddress, long endAddress)
+        {
+            using var iter = new VariableLengthBlittableScanIterator<Key, Value>(this, beginAddress, endAddress, ScanBufferingMode.NoBuffering, epoch, true);
+            OnEvictionObserver?.OnNext(iter);
         }
 
 

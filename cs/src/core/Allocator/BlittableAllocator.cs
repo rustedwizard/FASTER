@@ -21,12 +21,17 @@ namespace FASTER.core
 
         // Record sizes
         private static readonly int recordSize = Utility.GetSize(default(Record<Key, Value>));
+        private static readonly int recordInfoSize = Utility.GetSize(default(RecordInfo));
         private static readonly int keySize = Utility.GetSize(default(Key));
         private static readonly int valueSize = Utility.GetSize(default(Value));
 
+        private readonly OverflowPool<PageUnit> overflowPagePool;
+        
         public BlittableAllocator(LogSettings settings, IFasterEqualityComparer<Key> comparer, Action<long, long> evictCallback = null, LightEpoch epoch = null, Action<CommitInfo> flushCallback = null)
             : base(settings, comparer, evictCallback, epoch, flushCallback)
         {
+            overflowPagePool = new OverflowPool<PageUnit>(4, p => p.handle.Free());
+
             values = new byte[BufferSize][];
             handles = new GCHandle[BufferSize];
             pointers = new long[BufferSize];
@@ -75,6 +80,8 @@ namespace FASTER.core
             return recordSize;
         }
 
+        public override int GetFixedRecordSize() => recordSize;
+
         public override (int, int) GetInitialRecordSize<Input, FasterSession>(ref Key key, ref Input input, FasterSession fasterSession)
         {
             return (recordSize, recordSize);
@@ -104,6 +111,7 @@ namespace FASTER.core
             handles = null;
             pointers = null;
             values = null;
+            overflowPagePool.Dispose();
         }
 
         public override AddressInfo* GetKeyAddressInfo(long physicalAddress)
@@ -122,15 +130,27 @@ namespace FASTER.core
         /// <param name="index"></param>
         internal override void AllocatePage(int index)
         {
+            Interlocked.Increment(ref AllocatedPageCount);
+
+            if (overflowPagePool.TryGet(out var item))
+            {
+                handles[index] = item.handle;
+                pointers[index] = item.pointer;
+                values[index] = item.value;
+                return;
+            }
+
             var adjustedSize = PageSize + 2 * sectorSize;
             byte[] tmp = new byte[adjustedSize];
             Array.Clear(tmp, 0, adjustedSize);
 
             handles[index] = GCHandle.Alloc(tmp, GCHandleType.Pinned);
             long p = (long)handles[index].AddrOfPinnedObject();
-            pointers[index] = (p + (sectorSize - 1)) & ~(sectorSize - 1);
+            pointers[index] = (p + (sectorSize - 1)) & ~((long)sectorSize - 1);
             values[index] = tmp;
         }
+
+        internal override int OverflowPageCount => overflowPagePool.Count;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public override long GetPhysicalAddress(long logicalAddress)
@@ -143,7 +163,7 @@ namespace FASTER.core
             return *(nativePointers + pageIndex) + offset;
         }
 
-        protected override bool IsAllocated(int pageIndex)
+        internal override bool IsAllocated(int pageIndex)
         {
             return values[pageIndex] != null;
         }
@@ -193,7 +213,7 @@ namespace FASTER.core
             return page << LogPageSizeBits;
         }
 
-        protected override void ClearPage(long page, int offset)
+        internal override void ClearPage(long page, int offset)
         {
             if (offset == 0)
                 Array.Clear(values[page % BufferSize], offset, values[page % BufferSize].Length - offset);
@@ -202,6 +222,23 @@ namespace FASTER.core
                 // Adjust array offset for cache alignment
                 offset += (int)(pointers[page % BufferSize] - (long)handles[page % BufferSize].AddrOfPinnedObject());
                 Array.Clear(values[page % BufferSize], offset, values[page % BufferSize].Length - offset);
+            }
+        }
+
+        internal override void FreePage(long page)
+        {
+            ClearPage(page, 0);
+            if (EmptyPageCount > 0)
+            {
+                int index = (int)(page % BufferSize);
+                overflowPagePool.TryAdd(new PageUnit { 
+                    handle = handles[index], 
+                    pointer = pointers[index], 
+                    value = values[index] });
+                values[index] = null;
+                pointers[index] = 0;
+                handles[index] = default;
+                Interlocked.Decrement(ref AllocatedPageCount);
             }
         }
 
@@ -219,30 +256,6 @@ namespace FASTER.core
             handles = null;
             pointers = null;
             values = null;
-        }
-
-
-        private void WriteAsync<TContext>(IntPtr alignedSourceAddress, ulong alignedDestinationAddress, uint numBytesToWrite,
-                        DeviceIOCompletionCallback callback, PageAsyncFlushResult<TContext> asyncResult,
-                        IDevice device)
-        {
-            if (asyncResult.partial)
-            {
-                // Write only required bytes within the page
-                int aligned_start = (int)((asyncResult.fromAddress - (asyncResult.page << LogPageSizeBits)));
-                aligned_start = (aligned_start / sectorSize) * sectorSize;
-
-                int aligned_end = (int)((asyncResult.untilAddress - (asyncResult.page << LogPageSizeBits)));
-                aligned_end = ((aligned_end + (sectorSize - 1)) & ~(sectorSize - 1));
-
-                numBytesToWrite = (uint)(aligned_end - aligned_start);
-                device.WriteAsync(alignedSourceAddress + aligned_start, alignedDestinationAddress + (ulong)aligned_start, numBytesToWrite, callback, asyncResult);
-            }
-            else
-            {
-                device.WriteAsync(alignedSourceAddress, alignedDestinationAddress,
-                    numBytesToWrite, callback, asyncResult);
-            }
         }
 
         protected override void ReadAsync<TContext>(
@@ -309,7 +322,6 @@ namespace FASTER.core
         internal override void PopulatePage(byte* src, int required_bytes, long destinationPage)
         {
             throw new FasterException("BlittableAllocator memory pages are sector aligned - use direct copy");
-            // Buffer.MemoryCopy(src, (void*)pointers[destinationPage % BufferSize], required_bytes, required_bytes);
         }
 
         /// <summary>
@@ -324,6 +336,12 @@ namespace FASTER.core
             return new BlittableScanIterator<Key, Value>(this, beginAddress, endAddress, scanBufferingMode, epoch);
         }
 
+        /// <inheritdoc />
+        internal override void MemoryPageScan(long beginAddress, long endAddress)
+        {
+            using var iter = new BlittableScanIterator<Key, Value>(this, beginAddress, endAddress, ScanBufferingMode.NoBuffering, epoch, true);
+            OnEvictionObserver?.OnNext(iter);
+        }
 
         /// <summary>
         /// Read pages from specified device

@@ -29,10 +29,11 @@ namespace FASTER.test.recovery.objects
         [TearDown]
         public void TearDown()
         {
-            Directory.Delete(FasterFolderPath, true);
+            TestUtils.DeleteDirectory(FasterFolderPath);
         }
 
         [Test]
+        [Category("FasterKV")]
         public async ValueTask ObjectRecoveryTest3(
             [Values]CheckpointType checkpointType,
             [Values(1000)] int iterations,

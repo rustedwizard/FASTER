@@ -124,6 +124,25 @@ namespace FASTER.core
             [Out] out UInt32 lpNumberOfBytesWritten,
             [In] NativeOverlapped* lpOverlapped);
 
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern IntPtr CreateIoCompletionPort(
+            [In] SafeFileHandle hFile,
+            IntPtr ExistingCompletionPort,
+            UIntPtr CompletionKey,
+            uint NumberOfConcurrentThreads);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GetQueuedCompletionStatus(
+            [In] IntPtr hCompletionPort,
+            [Out] out UInt32 lpNumberOfBytesWritten,
+            [Out] out IntPtr lpCompletionKey,
+            [Out] out NativeOverlapped* lpOverlapped,
+            [In] UInt32 dwMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        internal static extern bool GetFileSizeEx(
+            [In] SafeFileHandle hFile,
+            [Out] out long lpFileSize);
 
         internal enum EMoveMethod : uint
         {
@@ -219,6 +238,18 @@ namespace FASTER.core
         }
 
         /// <summary>
+        /// Get number of groups (sockets) and processors per group
+        /// </summary>
+        /// <returns></returns>
+        public static (uint numGroups, uint numProcsPerGroup) GetNumGroupsProcsPerGroup()
+        {
+            uint nrOfProcessors = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
+            ushort nrOfProcessorGroups = GetActiveProcessorGroupCount();
+            uint nrOfProcsPerGroup = nrOfProcessors / nrOfProcessorGroups;
+            return (nrOfProcessorGroups, nrOfProcsPerGroup);
+        }
+
+        /// <summary>
         /// Accepts thread id = 0, 1, 2, ... and sprays them round-robin
         /// across all cores (viewed as a flat space). On NUMA machines,
         /// this gives us [core, socket] ordering of affinitization. That is, 
@@ -274,7 +305,7 @@ namespace FASTER.core
         /// <returns></returns>
         public static bool EnableProcessPrivileges()
         {
-#if NETSTANDARD
+#if NETSTANDARD || NET
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return false;
 #endif
@@ -320,7 +351,7 @@ namespace FASTER.core
 
         internal static bool EnableVolumePrivileges(string filename, SafeFileHandle handle)
         {
-#if NETSTANDARD
+#if NETSTANDARD || NET
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return false;
 #endif
@@ -360,7 +391,7 @@ namespace FASTER.core
         /// <returns></returns>
         public static bool SetFileSize(SafeFileHandle file_handle, long file_size)
         {
-#if NETSTANDARD
+#if NETSTANDARD || NET
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
                 return false;
 #endif

@@ -57,10 +57,11 @@ namespace FASTER.test.recovery.objectstore
             fht = null;
             log.Dispose();
             objlog.Dispose();
-            Directory.Delete(test_path, true);
+            TestUtils.DeleteDirectory(test_path);
         }
 
         [Test]
+        [Category("FasterKV")]
         public async ValueTask ObjectRecoveryTest1([Values]bool isAsync)
         {
             Populate();
@@ -114,7 +115,7 @@ namespace FASTER.test.recovery.objectstore
 
                 if (i % completePendingInterval == 0)
                 {
-                    session.CompletePending(false);
+                    session.CompletePending(false,false);
                 }
             }
 
@@ -165,7 +166,7 @@ namespace FASTER.test.recovery.objectstore
                 new DeviceLogCommitCheckpointManager(
                     new LocalStorageNamedDeviceFactory(),
                         new DefaultCheckpointNamingScheme(
-                          new DirectoryInfo(test_path).FullName)));
+                          new DirectoryInfo(test_path).FullName)), null);
 
             // Compute expected array
             long[] expected = new long[numUniqueKeys];

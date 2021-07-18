@@ -33,6 +33,7 @@ namespace FASTER.test
         }
 
         [Test]
+        [Category("FasterKV")]
         public void MemoryLogCompactionTest1()
         {
             using var session = fht.For(new MemoryCompaction()).NewSession<MemoryCompaction>();
@@ -87,7 +88,7 @@ namespace FASTER.test
             }
 
             // Test iteration of distinct live keys
-            using (var iter = fht.Iterate())
+            using (var iter = session.Iterate())
             {
                 int count = 0;
                 while (iter.GetNext(out RecordInfo recordInfo))
@@ -117,7 +118,7 @@ namespace FASTER.test
 
     public class MemoryCompaction : MemoryFunctions<ReadOnlyMemory<int>, int, int>
     {
-        public override void RMWCompletionCallback(ref ReadOnlyMemory<int> key, ref Memory<int> input, int ctx, Status status)
+        public override void RMWCompletionCallback(ref ReadOnlyMemory<int> key, ref Memory<int> input, ref (IMemoryOwner<int>, int) output, int ctx, Status status)
         {
             Assert.IsTrue(status == Status.OK);
         }

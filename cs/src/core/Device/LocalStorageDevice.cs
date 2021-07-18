@@ -15,6 +15,9 @@ namespace FASTER.core
     /// <summary>
     /// Local storage device
     /// </summary>
+#if NET5_0
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+#endif
     public unsafe class LocalStorageDevice : StorageDeviceBase
     {
         /// <summary>
@@ -24,19 +27,27 @@ namespace FASTER.core
         /// </summary>
         public static bool UsePrivileges = true;
 
+        /// <summary>
+        /// Number of IO completion threads dedicated to this instance. Used only
+        /// if useIoCompletionPort is set to true.
+        /// </summary>
+        public static int NumCompletionThreads = 1;
+
         private readonly bool preallocateFile;
         private readonly bool deleteOnClose;
         private readonly bool disableFileBuffering;
         private readonly SafeConcurrentDictionary<int, SafeFileHandle> logHandles;
-
+        private readonly bool useIoCompletionPort;
         private readonly ConcurrentQueue<SimpleAsyncResult> results;
         private static uint sectorSize = 0;
+        private bool _disposed;
 
         /// <summary>
         /// Number of pending reads on device
         /// </summary>
         private int numPending = 0;
 
+        private IntPtr ioCompletionPort;
 
         /// <summary>
         /// Constructor
@@ -47,13 +58,14 @@ namespace FASTER.core
         /// <param name="disableFileBuffering"></param>
         /// <param name="capacity">The maximum number of bytes this storage device can accommondate, or CAPACITY_UNSPECIFIED if there is no such limit </param>
         /// <param name="recoverDevice">Whether to recover device metadata from existing files</param>
+        /// <param name="useIoCompletionPort">Whether we use IO completion port with polling</param>
         public LocalStorageDevice(string filename,
                                   bool preallocateFile = false,
                                   bool deleteOnClose = false,
                                   bool disableFileBuffering = true,
                                   long capacity = Devices.CAPACITY_UNSPECIFIED,
-                                  bool recoverDevice = false)
-            : this(filename, preallocateFile, deleteOnClose, disableFileBuffering, capacity, recoverDevice, initialLogFileHandles: null)
+                                  bool recoverDevice = false, bool useIoCompletionPort = false)
+            : this(filename, preallocateFile, deleteOnClose, disableFileBuffering, capacity, recoverDevice, null, useIoCompletionPort)
         {
         }
 
@@ -66,7 +78,7 @@ namespace FASTER.core
         }
 
         /// <inheritdoc />
-        public override bool Throttle() => numPending > 120;
+        public override bool Throttle() => numPending > ThrottleLimit;
 
         /// <summary>
         /// Constructor with more options for derived classes
@@ -78,21 +90,40 @@ namespace FASTER.core
         /// <param name="capacity">The maximum number of bytes this storage device can accommondate, or CAPACITY_UNSPECIFIED if there is no such limit </param>
         /// <param name="recoverDevice">Whether to recover device metadata from existing files</param>
         /// <param name="initialLogFileHandles">Optional set of preloaded safe file handles, which can speed up hydration of preexisting log file handles</param>
+        /// <param name="useIoCompletionPort">Whether we use IO completion port with polling</param>
         protected internal LocalStorageDevice(string filename,
                                       bool preallocateFile = false,
                                       bool deleteOnClose = false,
                                       bool disableFileBuffering = true,
                                       long capacity = Devices.CAPACITY_UNSPECIFIED,
                                       bool recoverDevice = false,
-                                      IEnumerable<KeyValuePair<int, SafeFileHandle>> initialLogFileHandles = null)
+                                      IEnumerable<KeyValuePair<int, SafeFileHandle>> initialLogFileHandles = null,
+                                      bool useIoCompletionPort = true)
                 : base(filename, GetSectorSize(filename), capacity)
         {
-#if NETSTANDARD
+#if NETSTANDARD || NET
             if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
             {
                 throw new FasterException("Cannot use LocalStorageDevice from non-Windows OS platform, use ManagedLocalStorageDevice instead.");
             }
 #endif
+            ThrottleLimit = 120;
+            this.useIoCompletionPort = useIoCompletionPort;
+            this._disposed = false;
+
+            if (useIoCompletionPort)
+            {
+                ThreadPool.GetMaxThreads(out int workerThreads, out _);
+                ioCompletionPort = Native32.CreateIoCompletionPort(new SafeFileHandle(new IntPtr(-1), false), IntPtr.Zero, UIntPtr.Zero, (uint)(workerThreads + NumCompletionThreads));
+                for (int i = 0; i < NumCompletionThreads; i++)
+                {
+                    var thread = new Thread(() => new LocalStorageDeviceCompletionWorker().Start(ioCompletionPort, _callback))
+                    {
+                        IsBackground = true
+                    };
+                    thread.Start();
+                }
+            }
 
             if (UsePrivileges && preallocateFile)
                 Native32.EnableProcessPrivileges();
@@ -114,13 +145,13 @@ namespace FASTER.core
 
         private void RecoverFiles()
         {
-            FileInfo fi = new FileInfo(FileName); // may not exist
+            FileInfo fi = new(FileName); // may not exist
             DirectoryInfo di = fi.Directory;
             if (!di.Exists) return;
 
             string bareName = fi.Name;
 
-            List<int> segids = new List<int>();
+            List<int> segids = new();
             foreach (System.IO.FileInfo item in di.GetFiles(bareName + "*"))
             {
                 segids.Add(int.Parse(item.Name.Replace(bareName, "").Replace(".", "")));
@@ -304,8 +335,12 @@ namespace FASTER.core
         /// </summary>
         public override void Dispose()
         {
+            _disposed = true;
             foreach (var logHandle in logHandles.Values)
                 logHandle.Dispose();
+
+            if (useIoCompletionPort)
+                new SafeFileHandle(ioCompletionPort, true).Dispose();
 
             while (results.TryDequeue(out var entry))
             {
@@ -313,10 +348,37 @@ namespace FASTER.core
             }
         }
 
+        /// <inheritdoc/>
+        public override bool TryComplete()
+        {
+            if (!useIoCompletionPort) return true;
+
+            bool succeeded = Native32.GetQueuedCompletionStatus(ioCompletionPort, out uint num_bytes, out IntPtr completionKey, out NativeOverlapped* nativeOverlapped, 0);
+
+            if (nativeOverlapped != null)
+            {
+                int errorCode = succeeded ? 0 : Marshal.GetLastWin32Error();
+                _callback((uint)errorCode, num_bytes, nativeOverlapped);
+                return true;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        /// <inheritdoc/>
+        public override long GetFileSize(int segment)
+        {
+            if (segmentSize > 0) return segmentSize;
+            Native32.GetFileSizeEx(GetOrAddHandle(segment), out long size);
+            return size;
+        }
+
         /// <summary>
         /// Creates a SafeFileHandle for the specified segment. This can be used by derived classes to prepopulate logHandles in the constructor.
         /// </summary>
-        protected internal static SafeFileHandle CreateHandle(int segmentId, bool disableFileBuffering, bool deleteOnClose, bool preallocateFile, long segmentSize, string fileName)
+        protected internal static SafeFileHandle CreateHandle(int segmentId, bool disableFileBuffering, bool deleteOnClose, bool preallocateFile, long segmentSize, string fileName, IntPtr ioCompletionPort)
         {
             uint fileAccess = Native32.GENERIC_READ | Native32.GENERIC_WRITE;
             uint fileShare = unchecked(((uint)FileShare.ReadWrite & ~(uint)FileShare.Inheritable));
@@ -352,13 +414,21 @@ namespace FASTER.core
             if (preallocateFile && segmentSize != -1)
                 SetFileSize(fileName, logHandle, segmentSize);
 
-            try
+            if (ioCompletionPort != IntPtr.Zero)
             {
-                ThreadPool.BindHandle(logHandle);
+                ThreadPool.GetMaxThreads(out int workerThreads, out _);
+                Native32.CreateIoCompletionPort(logHandle, ioCompletionPort, (UIntPtr)(long)logHandle.DangerousGetHandle(), (uint)(workerThreads + NumCompletionThreads));
             }
-            catch (Exception e)
+            else
             {
-                throw new FasterException("Error binding log handle for " + GetSegmentName(fileName, segmentId) + ": " + e.ToString());
+                try
+                {
+                    ThreadPool.BindHandle(logHandle);
+                }
+                catch (Exception e)
+                {
+                    throw new FasterException("Error binding log handle for " + GetSegmentName(fileName, segmentId) + ": " + e.ToString());
+                }
             }
             return logHandle;
         }
@@ -390,11 +460,19 @@ namespace FASTER.core
             {
                 return h;
             }
-            return logHandles.GetOrAdd(_segmentId, segmentId => CreateHandle(segmentId));
+            if (_disposed) return null;
+            var result = logHandles.GetOrAdd(_segmentId, segmentId => CreateHandle(segmentId));
+            if (_disposed)
+            {
+                foreach (var logHandle in logHandles.Values)
+                    logHandle.Dispose();
+                return null;
+            }
+            return result;
         }
 
         private SafeFileHandle CreateHandle(int segmentId)
-            => CreateHandle(segmentId, this.disableFileBuffering, this.deleteOnClose, this.preallocateFile, this.segmentSize, this.FileName);
+            => CreateHandle(segmentId, this.disableFileBuffering, this.deleteOnClose, this.preallocateFile, this.segmentSize, this.FileName, this.ioCompletionPort);
 
         private static uint GetSectorSize(string filename)
         {
@@ -458,5 +536,28 @@ namespace FASTER.core
         public bool CompletedSynchronously => throw new NotImplementedException();
 
         public bool IsCompleted => throw new NotImplementedException();
+    }
+
+#if NET5_0
+    [System.Runtime.Versioning.SupportedOSPlatform("windows")]
+#endif
+    unsafe sealed class LocalStorageDeviceCompletionWorker
+    {
+        public void Start(IntPtr ioCompletionPort, IOCompletionCallback _callback)
+        {
+            while (true)
+            {
+                Thread.Yield();
+                bool succeeded = Native32.GetQueuedCompletionStatus(ioCompletionPort, out uint num_bytes, out IntPtr completionKey, out NativeOverlapped* nativeOverlapped, uint.MaxValue);
+
+                if (nativeOverlapped != null)
+                {
+                    int errorCode = succeeded ? 0 : Marshal.GetLastWin32Error();
+                    _callback((uint)errorCode, num_bytes, nativeOverlapped);
+                }
+                else
+                    break;
+            }
+        }
     }
 }

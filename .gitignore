@@ -192,4 +192,9 @@ packages/
 .vs/
 *.lib
 nativebin/
-/cs/benchmark/Properties/launchSettings.json
+/cs/**/launchSettings.json
+
+# JetBrains
+cs/.idea/
+cs/remote/.idea
+cs/libdpr/.idea

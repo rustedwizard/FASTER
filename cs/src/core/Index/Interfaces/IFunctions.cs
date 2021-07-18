@@ -36,9 +36,10 @@ namespace FASTER.core
         /// </summary>
         /// <param name="key">The key for this record</param>
         /// <param name="input">The user input that was used to perform the modification</param>
+        /// <param name="output">The result of the RMW operation; if this is a struct, then it will be a temporary and should be copied to <paramref name="ctx"/></param>
         /// <param name="ctx">The application context passed through the pending operation</param>
         /// <param name="status">The result of the pending operation</param>
-        void RMWCompletionCallback(ref Key key, ref Input input, Context ctx, Status status);
+        void RMWCompletionCallback(ref Key key, ref Input input, ref Output output, Context ctx, Status status);
 
         /// <summary>
         /// Delete completion
@@ -60,7 +61,8 @@ namespace FASTER.core
         /// <param name="key">The key for this record</param>
         /// <param name="input">The user input to be used for computing the updated <paramref name="value"/></param>
         /// <param name="value">The destination to be updated; because this is an insert, there is no previous value there.</param>
-        void InitialUpdater(ref Key key, ref Input input, ref Value value);
+        /// <param name="output">The location where the result of the <paramref name="input"/> operation on <paramref name="value"/> is to be copied</param>
+        void InitialUpdater(ref Key key, ref Input input, ref Value value, ref Output output);
 
         /// <summary>
         /// Whether we need to invoke copy-update for RMW
@@ -68,8 +70,9 @@ namespace FASTER.core
         /// <param name="key">The key for this record</param>
         /// <param name="input">The user input to be used for computing the updated value</param>
         /// <param name="oldValue">The existing value that would be copied.</param>
-        bool NeedCopyUpdate(ref Key key, ref Input input, ref Value oldValue)
-#if NETSTANDARD2_1
+        /// <param name="output">The location where the result of the <paramref name="input"/> operation on <paramref name="oldValue"/> is to be copied</param>
+        bool NeedCopyUpdate(ref Key key, ref Input input, ref Value oldValue, ref Output output)
+#if NETSTANDARD2_1 || NET
             => true
 #endif
             ;
@@ -81,7 +84,8 @@ namespace FASTER.core
         /// <param name="input">The user input to be used for computing <paramref name="newValue"/> from <paramref name="oldValue"/></param>
         /// <param name="oldValue">The previous value to be copied/updated</param>
         /// <param name="newValue">The destination to be updated; because this is an copy to a new location, there is no previous value there.</param>
-        void CopyUpdater(ref Key key, ref Input input, ref Value oldValue, ref Value newValue);
+        /// <param name="output">The location where <paramref name="newValue"/> is to be copied</param>
+        void CopyUpdater(ref Key key, ref Input input, ref Value oldValue, ref Value newValue, ref Output output);
 
         /// <summary>
         /// In-place update for RMW
@@ -89,7 +93,8 @@ namespace FASTER.core
         /// <param name="key">The key for this record</param>
         /// <param name="input">The user input to be used for computing the updated <paramref name="value"/></param>
         /// <param name="value">The destination to be updated; because this is an in-place update, there is a previous value there.</param>
-        bool InPlaceUpdater(ref Key key, ref Input input, ref Value value);
+        /// <param name="output">The location where the result of the <paramref name="input"/> operation on <paramref name="value"/> is to be copied</param>
+        bool InPlaceUpdater(ref Key key, ref Input input, ref Value value, ref Output output);
 
         /// <summary>
         /// Non-concurrent reader. 
@@ -125,6 +130,44 @@ namespace FASTER.core
         /// <param name="src">The value to be copied to <paramref name="dst"/></param>
         /// <param name="dst">The location where <paramref name="src"/> is to be copied; because this method is called only for in-place updates, there is a previous value there.</param>
         bool ConcurrentWriter(ref Key key, ref Value src, ref Value dst);
+
+        /// <summary>
+        /// Whether this Functions instance supports locking. Iff so, FASTER will call <see cref="Lock(ref RecordInfo, ref Key, ref Value, LockType, ref long)"/> 
+        /// and <see cref="Unlock(ref RecordInfo, ref Key, ref Value, LockType, long)"/>.
+        /// </summary>
+        bool SupportsLocking { get; }
+
+        /// <summary>
+        /// User-provided lock call, defaulting to no-op. A default exclusive implementation is available via <see cref="RecordInfo.SpinLock()"/>.
+        /// See also <see cref="IntExclusiveLocker"/> to use two bits of an existing int value.
+        /// </summary>
+        /// <param name="recordInfo">The header for the current record</param>
+        /// <param name="key">The key for the current record</param>
+        /// <param name="value">The value for the current record</param>
+        /// <param name="lockType">The type of lock being taken</param>
+        /// <param name="lockContext">Context-specific information; will be passed to <see cref="Unlock(ref RecordInfo, ref Key, ref Value, LockType, long)"/></param>
+        /// <remarks>
+        /// This is called only for records guaranteed to be in the mutable range.
+        /// </remarks>
+        void Lock(ref RecordInfo recordInfo, ref Key key, ref Value value, LockType lockType, ref long lockContext);
+
+        /// <summary>
+        /// User-provided unlock call, defaulting to no-op. A default exclusive implementation is available via <see cref="RecordInfo.Unlock()"/>.
+        /// See also <see cref="IntExclusiveLocker"/> to use two bits of an existing int value.
+        /// </summary>
+        /// <param name="recordInfo">The header for the current record</param>
+        /// <param name="key">The key for the current record</param>
+        /// <param name="value">The value for the current record</param>
+        /// <param name="lockType">The type of lock being released, as passed to <see cref="Lock(ref RecordInfo, ref Key, ref Value, LockType, ref long)"/></param>
+        /// <param name="lockContext">The context returned from <see cref="Lock(ref RecordInfo, ref Key, ref Value, LockType, ref long)"/></param>
+        /// <remarks>
+        /// This is called only for records guaranteed to be in the mutable range.
+        /// </remarks>
+        /// <returns>
+        /// True if no inconsistencies detected. Otherwise, the lock and user's callback are reissued.
+        /// Currently this is handled only for <see cref="ConcurrentReader(ref Key, ref Input, ref Value, ref Output)"/>.
+        /// </returns>
+        bool Unlock(ref RecordInfo recordInfo, ref Key key, ref Value value, LockType lockType, long lockContext);
     }
 
     /// <summary>
